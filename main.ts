@@ -1,199 +1,1460 @@
-import { Plugin, ItemView, WorkspaceLeaf } from "obsidian";
+/* main.ts — Four Winds Plugin */
+
+import {
+	Plugin,
+	ItemView,
+	WorkspaceLeaf,
+	TFile,
+	TFolder,
+	Modal,
+	Setting,
+	PluginSettingTab,
+	MarkdownRenderer,
+	Notice,
+	FuzzySuggestModal,
+	TextAreaComponent,
+} from "obsidian";
+import type cytoscape from "cytoscape";
 import * as cytoscapeImport from "cytoscape";
-const cytoscapeFn = (cytoscapeImport as any).default ? (cytoscapeImport as any).default : cytoscapeImport;
+const cytoscapeFn = (cytoscapeImport as any).default
+	? (cytoscapeImport as any).default
+	: cytoscapeImport;
 
 // Extend the App type to include plugins
 declare module "obsidian" {
-    interface App {
-        plugins: {
-            getPlugin: (id: string) => any;
-        };
-    }
-}
-
-class CompassView extends ItemView {
-    static VIEW_TYPE = "compass-view";
-
-    private plugin: CompassPlugin;
-    private renderTimeout: number | null = null; // For debouncing
-
-    constructor(leaf: WorkspaceLeaf, plugin: CompassPlugin) {
-        super(leaf);
-        this.plugin = plugin;
-    }
-
-    getIcon(): string {
-        return "compass";
-    }
-
-    getViewType(): string {
-        return CompassView.VIEW_TYPE;
-    }
-
-    getDisplayText(): string {
-        return "Compass";
-    }
-
-    async onOpen(): Promise<void> {
-        this.render();
-        this.registerEvent(
-            this.app.workspace.on("file-open", () => this.handleFileOpen())
-        );
-    }
-
-    async onClose(): Promise<void> {
-        this.cleanupRenderTimeout();
-    }
-
-    handleFileOpen() {
-        // Debounce the render to avoid excessive calls
-        this.cleanupRenderTimeout();
-        this.renderTimeout = window.setTimeout(() => {
-            this.render();
-        }, 300); // 300ms delay to stabilize rendering
-    }
-
-    cleanupRenderTimeout() {
-        if (this.renderTimeout) {
-            clearTimeout(this.renderTimeout);
-            this.renderTimeout = null;
-        }
-    }
-
-    async render() {
-        const container = this.containerEl.children[1];
-        container.empty();
-
-        const activeFile = this.app.workspace.getActiveFile();
-        if (!activeFile) {
-            container.createEl("p", { text: "No active note selected." });
-            return;
-        }
-
-        try {
-            const content = await this.app.vault.cachedRead(activeFile);
-
-            if (!content || content.trim().length === 0) {
-                container.createEl("p", { text: "The selected note has no content." });
-                return;
-            }
-
-            const directions = ["north", "south", "east", "west"];
-
-            // Map to store links per direction
-            const directionLinks: Record<string, Set<string>> = {
-                north: new Set(),
-                south: new Set(),
-                east: new Set(),
-                west: new Set(),
-            };
-
-            // Fetch all dynamic links first
-            await Promise.all(
-                directions.map(async (dir) => {
-                    if (dir === "north") {
-                        const dynamicLinks = await this.fetchDynamicLinks("ad-south", activeFile.name);
-                        dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-                    } else if (dir === "south") {
-                        const dynamicLinks = await this.fetchDynamicLinks("ad-north", activeFile.name);
-                        dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-                    } else if (dir === "east") {
-                        const dynamicLinks = await this.fetchDynamicLinks("ad-east", activeFile.name);
-                        dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-                    } else if (dir === "west") {
-                        const dynamicLinks = await this.fetchDynamicLinks("ad-west", activeFile.name);
-                        dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-                    }
-                })
-            );
-
-            // Process each direction
-            directions.forEach((dir) => {
-                const section = container.createEl("div", { cls: "compass-section" });
-				section.createEl("hr", { text: "" });
-                section.createEl("h6", { text: dir.toLowerCase()});
-
-
-                // Add hardcoded links
-                const hardcodedLinks = this.extractHardcodedLinks(dir, content);
-                hardcodedLinks.forEach((link) => directionLinks[dir].add(link));
-
-                // Render all unique links
-                const allLinks = Array.from(directionLinks[dir]);
-                if (allLinks.length > 0) {
-                    allLinks.forEach((link) => {
-                        const linkEl = section.createEl("p");
-                        linkEl.createEl("a", {
-                            text: link,
-                            href: `obsidian://open?vault=${this.app.vault.getName()}&file=${encodeURIComponent(
-                                link
-                            )}`,
-                        });
-                    });
-                } else {
-                    section.createEl("p", { text: "..." }); // No links found
-                }
-            });
-
-            console.log("Compass View rendered successfully.");
-        } catch (error) {
-        }
-    }
-
-    private extractHardcodedLinks(direction: string, content: string): string[] {
-        const regex = new RegExp(
-            `\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``,
-            "gm"
-        );
-        const matches = Array.from(content.matchAll(regex));
-        const links: string[] = [];
-        for (const match of matches) {
-            const sectionContent = match[1];
-            const linkRegex = /\[\[(.*?)\]\]/g;
-            const sectionLinks = Array.from(sectionContent.matchAll(linkRegex), (m) => m[1]);
-            links.push(...sectionLinks);
-        }
-        return links;
-    }
-
-    private async fetchDynamicLinks(admonitionType: string, currentFile: string): Promise<string[]> {
-        try {
-            const dv = this.app.plugins.getPlugin("dataview");
-            if (!dv) throw new Error("Dataview plugin is not enabled or not available.");
-
-            const allNotes = dv.api.pages();
-            const result = new Set<string>();
-
-            for (const note of allNotes) {
-                const content = await dv.api.io.load(note.file.path) || "";
-
-                const regex = new RegExp(
-                    `\`\`\`${admonitionType}[\\s\\S]*?\\[\\[${currentFile}\\]\\][\\s\\S]*?\`\`\``,
-                    "gm"
-                );
-                const matches = content.match(regex);
-
-                if (matches) {
-                    result.add(note.file.name);
-                }
-            }
-
-            return Array.from(result).sort();
-        } catch (error) {
-            return [];
-        }
-    }
+	interface App {
+		plugins: {
+			getPlugin: (id: string) => any;
+		};
+	}
 }
 
 /*──────────────────────────────────────────────
-Navigation View Code
+   Settings
 ──────────────────────────────────────────────*/
-class NavigationView extends ItemView {
+type SeedSortMode = "shuffle" | "cday" | "mday" | "tag";
+
+interface FourWindsSettings {
+	seedDirectories: string[];
+	discoveryDirectories: string[];
+	autoLink: boolean;
+	// Direction labels
+	directionLabels: {
+		north: string;
+		east: string;
+		south: string;
+		west: string;
+	};
+	// Seeds
+	seedTags: string[];
+	seedSortMode: SeedSortMode;
+	seedField: string;
+	// Processing
+	templates: Array<{
+		path: string;
+		captureHeading: string;
+		captureFormat: string;
+		destinationFolder: string;
+	}>;
+	// Stella
+	stellaOnProcess: boolean;
+}
+
+const DEFAULT_SETTINGS: FourWindsSettings = {
+	seedDirectories: ["Forest"],
+	discoveryDirectories: ["Forest", "Garden"],
+	autoLink: false,
+	directionLabels: {
+		north: "North",
+		east: "East",
+		south: "South",
+		west: "West",
+	},
+	seedTags: [],
+	seedSortMode: "shuffle",
+	seedField: "seed",
+	templates: [],
+	stellaOnProcess: false,
+};
+
+/*──────────────────────────────────────────────
+   SwipeHandler — reusable pointer-event handler
+──────────────────────────────────────────────*/
+type SwipeDirection = "left" | "right" | "up" | "down";
+
+interface SwipeHandlerOptions {
+	el: HTMLElement;
+	threshold?: number;
+	horizontalOnly?: boolean;
+	onSwipe: (dir: SwipeDirection) => void;
+	onTap?: () => void;
+	onMove?: (dx: number, dy: number) => void;
+}
+
+class SwipeHandler {
+	private el: HTMLElement;
+	private threshold: number;
+	private horizontalOnly: boolean;
+	private onSwipe: (dir: SwipeDirection) => void;
+	private onTap?: () => void;
+	private onMove?: (dx: number, dy: number) => void;
+
+	private startX = 0;
+	private startY = 0;
+	private tracking = false;
+
+	private boundDown: (e: PointerEvent) => void;
+	private boundMove: (e: PointerEvent) => void;
+	private boundUp: (e: PointerEvent) => void;
+
+	constructor(opts: SwipeHandlerOptions) {
+		this.el = opts.el;
+		this.threshold = opts.threshold ?? 50;
+		this.horizontalOnly = opts.horizontalOnly ?? false;
+		this.onSwipe = opts.onSwipe;
+		this.onTap = opts.onTap;
+		this.onMove = opts.onMove;
+
+		this.boundDown = this.handleDown.bind(this);
+		this.boundMove = this.handleMove.bind(this);
+		this.boundUp = this.handleUp.bind(this);
+
+		this.el.addEventListener("pointerdown", this.boundDown);
+		this.el.addEventListener("pointermove", this.boundMove);
+		this.el.addEventListener("pointerup", this.boundUp);
+		this.el.style.touchAction = "none";
+	}
+
+	private handleDown(e: PointerEvent) {
+		// Don't capture on interactive elements
+		const target = e.target as HTMLElement;
+		if (target.closest("select, input, textarea, button, .four-winds-tag, .four-winds-tag-add, .four-winds-tag-add-wrapper")) {
+			return;
+		}
+		this.startX = e.clientX;
+		this.startY = e.clientY;
+		this.tracking = true;
+		this.el.setPointerCapture(e.pointerId);
+	}
+
+	private handleMove(e: PointerEvent) {
+		if (!this.tracking) return;
+		const dx = e.clientX - this.startX;
+		const dy = e.clientY - this.startY;
+		this.onMove?.(dx, dy);
+	}
+
+	private handleUp(e: PointerEvent) {
+		if (!this.tracking) return;
+		this.tracking = false;
+
+		const dx = e.clientX - this.startX;
+		const dy = e.clientY - this.startY;
+		const absDx = Math.abs(dx);
+		const absDy = Math.abs(dy);
+
+		if (this.horizontalOnly) {
+			if (absDx > this.threshold) {
+				this.onSwipe(dx < 0 ? "left" : "right");
+				return;
+			}
+		} else {
+			if (absDx > this.threshold || absDy > this.threshold) {
+				if (absDx > absDy) {
+					this.onSwipe(dx < 0 ? "left" : "right");
+				} else {
+					this.onSwipe(dy < 0 ? "up" : "down");
+				}
+				return;
+			}
+		}
+
+		// Below threshold — tap
+		this.onTap?.();
+	}
+
+	destroy() {
+		this.el.removeEventListener("pointerdown", this.boundDown);
+		this.el.removeEventListener("pointermove", this.boundMove);
+		this.el.removeEventListener("pointerup", this.boundUp);
+	}
+}
+
+/*──────────────────────────────────────────────
+   Helper: Fisher-Yates shuffle
+──────────────────────────────────────────────*/
+function shuffle<T>(arr: T[]): T[] {
+	const a = [...arr];
+	for (let i = a.length - 1; i > 0; i--) {
+		const j = Math.floor(Math.random() * (i + 1));
+		[a[i], a[j]] = [a[j], a[i]];
+	}
+	return a;
+}
+
+/*──────────────────────────────────────────────
+   Helper: Gather .md files from directories
+──────────────────────────────────────────────*/
+function gatherFiles(app: any, directories: string[]): TFile[] {
+	const files: TFile[] = [];
+	const seen = new Set<string>();
+	for (const dirPath of directories) {
+		const folder = app.vault.getAbstractFileByPath(dirPath);
+		if (!(folder instanceof TFolder)) continue;
+		collectMarkdownFiles(folder, files, seen);
+	}
+	return files;
+}
+
+function collectMarkdownFiles(folder: TFolder, out: TFile[], seen: Set<string>) {
+	for (const child of folder.children) {
+		if (child instanceof TFile && child.extension === "md" && !seen.has(child.path)) {
+			seen.add(child.path);
+			out.push(child);
+		} else if (child instanceof TFolder) {
+			collectMarkdownFiles(child, out, seen);
+		}
+	}
+}
+
+/*──────────────────────────────────────────────
+   Helper: addLinkToDirection
+──────────────────────────────────────────────*/
+let linkMutex = false;
+
+async function addLinkToDirection(
+	app: any,
+	filePath: string,
+	targetName: string,
+	direction: string
+): Promise<void> {
+	// Simple mutex to prevent race conditions on rapid swipes
+	while (linkMutex) {
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	linkMutex = true;
+	try {
+		const file = app.vault.getAbstractFileByPath(filePath);
+		if (!(file instanceof TFile)) return;
+
+		let content = await app.vault.read(file);
+		const link = `[[${targetName}]]`;
+		const blockTag = `ad-${direction}`;
+		const blockRegex = new RegExp("```" + blockTag + "\\n([\\s\\S]*?)```", "m");
+		const match = blockRegex.exec(content);
+
+		if (match) {
+			// Block exists — check if link already present
+			if (match[1].contains(link)) return;
+			const insertPos = match.index + match[0].length - 3; // before closing ```
+			content = content.slice(0, insertPos) + link + "\n" + content.slice(insertPos);
+		} else {
+			// Create new block at end of file
+			content = content.trimEnd() + "\n\n```" + blockTag + "\n" + link + "\n```\n";
+		}
+
+		await app.vault.modify(file, content);
+	} finally {
+		linkMutex = false;
+	}
+}
+
+/*──────────────────────────────────────────────
+   Helper: get tags from a file
+──────────────────────────────────────────────*/
+function getFileTags(app: any, file: TFile): string[] {
+	const cache = app.metadataCache.getFileCache(file);
+	const tags: string[] = [];
+	if (cache?.frontmatter?.tags) {
+		const t = cache.frontmatter.tags;
+		if (Array.isArray(t)) tags.push(...t);
+		else if (typeof t === "string") tags.push(t);
+	}
+	return tags;
+}
+
+/*──────────────────────────────────────────────
+   Helper: extract seed capture from content
+──────────────────────────────────────────────*/
+function extractSeedCapture(content: string, fieldName: string): string {
+	// Match inline dataview field: `fieldName:: value`
+	const regex = new RegExp(`^${escapeRegExpStr(fieldName)}::(.+)$`, "m");
+	const match = regex.exec(content);
+	return match ? match[1].trim() : "";
+}
+
+function escapeRegExpStr(str: string): string {
+	return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/*──────────────────────────────────────────────
+   Helper: sort files by mode
+──────────────────────────────────────────────*/
+function sortFiles(files: TFile[], mode: SeedSortMode, app: any, filterTag?: string): TFile[] {
+	let filtered = files;
+
+	// Filter by tag if set
+	if (filterTag) {
+		filtered = filtered.filter((f) => getFileTags(app, f).includes(filterTag));
+	}
+
+	switch (mode) {
+		case "cday":
+			return [...filtered].sort((a, b) => a.stat.ctime - b.stat.ctime);
+		case "mday":
+			return [...filtered].sort((a, b) => b.stat.mtime - a.stat.mtime);
+		case "tag":
+			return [...filtered].sort((a, b) => {
+				const ta = getFileTags(app, a).join(",");
+				const tb = getFileTags(app, b).join(",");
+				return ta.localeCompare(tb);
+			});
+		case "shuffle":
+		default:
+			return shuffle(filtered);
+	}
+}
+
+/*──────────────────────────────────────────────
+   Helper: get all tags from vault
+──────────────────────────────────────────────*/
+function getAllVaultTags(app: any): string[] {
+	const tags = new Set<string>();
+	for (const file of app.vault.getMarkdownFiles()) {
+		for (const t of getFileTags(app, file)) {
+			tags.add(t);
+		}
+	}
+	return [...tags].sort();
+}
+
+/*──────────────────────────────────────────────
+   Fuzzy File Picker Modal
+──────────────────────────────────────────────*/
+class FileSuggestModal extends FuzzySuggestModal<TFile> {
+	private files: TFile[];
+	private onChoose: (file: TFile) => void;
+
+	constructor(app: any, files: TFile[], onChoose: (file: TFile) => void) {
+		super(app);
+		this.files = files;
+		this.onChoose = onChoose;
+		this.setPlaceholder("Search for a note...");
+		this.modalEl.addClass("four-winds-modal");
+	}
+
+	getItems(): TFile[] {
+		return this.files;
+	}
+
+	getItemText(item: TFile): string {
+		return item.path;
+	}
+
+	onChooseItem(item: TFile): void {
+		this.onChoose(item);
+	}
+}
+
+/*──────────────────────────────────────────────
+   Template Chooser Modal (for process)
+──────────────────────────────────────────────*/
+class TemplateChooserModal extends FuzzySuggestModal<string> {
+	private paths: string[];
+	private onChoose: (path: string) => void;
+
+	constructor(app: any, paths: string[], onChoose: (path: string) => void) {
+		super(app);
+		this.paths = paths;
+		this.onChoose = onChoose;
+		this.setPlaceholder("Choose a template...");
+		this.modalEl.addClass("four-winds-modal");
+	}
+
+	getItems(): string[] {
+		return this.paths;
+	}
+
+	getItemText(item: string): string {
+		return item;
+	}
+
+	onChooseItem(item: string): void {
+		this.onChoose(item);
+	}
+}
+
+/*──────────────────────────────────────────────
+   Tag Suggest Modal (for adding tags in seeds)
+──────────────────────────────────────────────*/
+class TagSuggestModal extends FuzzySuggestModal<string> {
+	private tagList: string[];
+	private callback: (tag: string) => void;
+
+	constructor(app: any, tags: string[], callback: (tag: string) => void) {
+		super(app);
+		this.tagList = tags;
+		this.callback = callback;
+		this.setPlaceholder("Type to search or create a tag...");
+		this.modalEl.addClass("four-winds-modal");
+
+		// Allow Enter to commit custom input when no exact match selected
+		this.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+			if (e.key === "Enter") {
+				const val = this.inputEl.value.trim();
+				// If the typed value isn't in the list, treat it as a new tag
+				if (val && !this.tagList.includes(val)) {
+					e.preventDefault();
+					e.stopPropagation();
+					this.close();
+					this.callback(val);
+				}
+			}
+		});
+	}
+
+	getItems(): string[] {
+		return this.tagList;
+	}
+
+	getItemText(item: string): string {
+		return item;
+	}
+
+	onChooseItem(item: string): void {
+		this.callback(item);
+	}
+}
+
+class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
+	private callback: (folder: TFolder) => void;
+
+	constructor(app: any, callback: (folder: TFolder) => void) {
+		super(app);
+		this.callback = callback;
+		this.setPlaceholder("Choose a folder...");
+		this.modalEl.addClass("four-winds-modal");
+	}
+
+	getItems(): TFolder[] {
+		const folders: TFolder[] = [];
+		this.app.vault.getAllLoadedFiles().forEach((f: any) => {
+			if (f instanceof TFolder) folders.push(f);
+		});
+		return folders.sort((a, b) => a.path.localeCompare(b.path));
+	}
+
+	getItemText(item: TFolder): string {
+		return item.path || "/";
+	}
+
+	onChooseItem(item: TFolder): void {
+		this.callback(item);
+	}
+}
+
+/*──────────────────────────────────────────────
+   Seeds Modal
+──────────────────────────────────────────────*/
+class SeedsModal extends Modal {
+	private plugin: FourWindsPlugin;
+	private allFiles: TFile[];
+	private cards: TFile[];
+	private index: number;
+	private deletedStack: TFile[];
+	private swipeHandler: SwipeHandler | null = null;
+	private keyHandler: (e: KeyboardEvent) => void;
+
+	private activeTagFilter: string;
+	private activeSortMode: SeedSortMode;
+
+	private cardEl: HTMLElement;
+	private counterEl: HTMLElement;
+	private filterBarEl: HTMLElement;
+
+	constructor(app: any, plugin: FourWindsPlugin) {
+		super(app);
+		this.plugin = plugin;
+		this.allFiles = [];
+		this.cards = [];
+		this.index = 0;
+		this.deletedStack = [];
+		this.activeTagFilter = "";
+		this.activeSortMode = plugin.settings.seedSortMode;
+	}
+
+	async onOpen() {
+		const { contentEl } = this;
+		contentEl.addClass("four-winds-seeds-modal");
+		this.modalEl.addClass("four-winds-modal");
+
+		this.allFiles = gatherFiles(this.app, this.plugin.settings.seedDirectories);
+		if (this.allFiles.length === 0) {
+			contentEl.createEl("p", { text: "No seeds found in configured directories." });
+			return;
+		}
+
+		// Filter bar
+		this.filterBarEl = contentEl.createDiv({ cls: "four-winds-filter-bar" });
+		this.renderFilterBar();
+
+		// Apply initial sort
+		this.applyFilterAndSort();
+
+		// Counter
+		this.counterEl = contentEl.createDiv({ cls: "four-winds-counter" });
+
+		// Card area
+		this.cardEl = contentEl.createDiv({ cls: "four-winds-card" });
+
+		// Action buttons
+		const actions = contentEl.createDiv({ cls: "four-winds-actions" });
+
+		const trashBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-trash" });
+		trashBtn.setText("Delete");
+		trashBtn.createEl("span", { cls: "four-winds-kbd", text: "←" });
+		trashBtn.addEventListener("click", () => this.swipeLeft());
+
+		const undoBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-undo" });
+		undoBtn.setText("Undo");
+		undoBtn.createEl("span", { cls: "four-winds-kbd", text: "Z" });
+		undoBtn.addEventListener("click", () => this.undo());
+
+		const skipBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-skip" });
+		skipBtn.setText("Skip");
+		skipBtn.createEl("span", { cls: "four-winds-kbd", text: "→" });
+		skipBtn.addEventListener("click", () => this.swipeRight());
+
+		const moveBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-move" });
+		moveBtn.setText("Move");
+		moveBtn.createEl("span", { cls: "four-winds-kbd", text: "↓" });
+		moveBtn.addEventListener("click", () => this.moveFile());
+
+		const processBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-process" });
+		processBtn.setText("Process");
+		processBtn.createEl("span", { cls: "four-winds-kbd", text: "↑" });
+		processBtn.addEventListener("click", () => this.processSeed());
+
+		// Keyboard shortcuts
+		this.keyHandler = (e: KeyboardEvent) => {
+			if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+			switch (e.key) {
+				case "ArrowLeft":
+					e.preventDefault();
+					this.swipeLeft();
+					break;
+				case "ArrowRight":
+					e.preventDefault();
+					this.swipeRight();
+					break;
+				case "ArrowUp":
+					e.preventDefault();
+					this.processSeed();
+					break;
+				case "ArrowDown":
+					e.preventDefault();
+					this.moveFile();
+					break;
+				case "z":
+				case "Z":
+					e.preventDefault();
+					this.undo();
+					break;
+				case "o":
+				case "O":
+					e.preventDefault();
+					this.openFile();
+					break;
+			}
+		};
+		document.addEventListener("keydown", this.keyHandler);
+
+		await this.renderCard();
+	}
+
+	onClose() {
+		this.swipeHandler?.destroy();
+		document.removeEventListener("keydown", this.keyHandler);
+
+		// Trash deleted files
+		if (this.deletedStack.length > 0) {
+			const count = this.deletedStack.length;
+			new Notice(`Trashing ${count} seed(s)...`);
+			for (const f of this.deletedStack) {
+				this.app.vault.trash(f, false);
+			}
+		}
+	}
+
+	private renderFilterBar() {
+		this.filterBarEl.empty();
+
+		// Tag filter dropdown
+		const allTags = new Set<string>();
+		for (const f of this.allFiles) {
+			for (const t of getFileTags(this.app, f)) allTags.add(t);
+		}
+		// Also include configured seed tags
+		for (const t of this.plugin.settings.seedTags) {
+			if (t) allTags.add(t);
+		}
+
+		const tagSelect = this.filterBarEl.createEl("select", { cls: "four-winds-filter-select" });
+		tagSelect.createEl("option", { text: "All tags", attr: { value: "" } });
+		for (const tag of [...allTags].sort()) {
+			const opt = tagSelect.createEl("option", { text: tag, attr: { value: tag } });
+			if (tag === this.activeTagFilter) opt.selected = true;
+		}
+		tagSelect.addEventListener("change", () => {
+			this.activeTagFilter = tagSelect.value;
+			this.applyFilterAndSort();
+			this.index = 0;
+			this.renderCard();
+		});
+
+		// Sort dropdown
+		const sortSelect = this.filterBarEl.createEl("select", { cls: "four-winds-filter-select" });
+		const sortOptions: { val: SeedSortMode; label: string }[] = [
+			{ val: "shuffle", label: "Shuffle" },
+			{ val: "cday", label: "Created (oldest)" },
+			{ val: "mday", label: "Modified (newest)" },
+			{ val: "tag", label: "By tag" },
+		];
+		for (const so of sortOptions) {
+			const opt = sortSelect.createEl("option", { text: so.label, attr: { value: so.val } });
+			if (so.val === this.activeSortMode) opt.selected = true;
+		}
+		sortSelect.addEventListener("change", () => {
+			this.activeSortMode = sortSelect.value as SeedSortMode;
+			this.applyFilterAndSort();
+			this.index = 0;
+			this.renderCard();
+		});
+	}
+
+	private applyFilterAndSort() {
+		this.cards = sortFiles(this.allFiles, this.activeSortMode, this.app, this.activeTagFilter || undefined);
+	}
+
+	private async renderCard() {
+		if (this.index >= this.cards.length) {
+			this.cardEl.empty();
+			const msg = this.cards.length === 0 ? "No seeds match the current filter." : "All seeds processed!";
+			this.cardEl.createEl("p", { cls: "four-winds-done", text: msg });
+			this.updateCounter();
+			return;
+		}
+
+		this.cardEl.empty();
+		this.swipeHandler?.destroy();
+
+		const file = this.cards[this.index];
+		const content = await this.app.vault.cachedRead(file);
+		const tags = getFileTags(this.app, file);
+
+		// Title
+		this.cardEl.createEl("h3", { text: file.basename, cls: "four-winds-card-title" });
+
+		// Tag pills
+		const tagContainer = this.cardEl.createDiv({ cls: "four-winds-tags" });
+		this.renderTags(tagContainer, tags, file);
+
+		// Content preview — render the note as-is
+		const previewEl = this.cardEl.createDiv({ cls: "four-winds-card-preview" });
+		const previewText = content;
+		await MarkdownRenderer.renderMarkdown(previewText, previewEl, file.path, this.plugin);
+
+		// Swipe handler
+		this.swipeHandler = new SwipeHandler({
+			el: this.cardEl,
+			horizontalOnly: true,
+			onSwipe: (dir) => {
+				if (dir === "left") this.swipeLeft();
+				else if (dir === "right") this.swipeRight();
+			},
+			onMove: (dx) => {
+				this.cardEl.style.transform = `translateX(${dx}px) rotate(${dx * 0.05}deg)`;
+				this.cardEl.style.opacity = `${1 - Math.abs(dx) / 400}`;
+			},
+		});
+
+		this.updateCounter();
+	}
+
+	private renderTags(container: HTMLElement, tags: string[], file: TFile) {
+		container.empty();
+		for (const tag of tags) {
+			const pill = container.createEl("span", { cls: "four-winds-tag", text: tag });
+			pill.addEventListener("click", async (e) => {
+				e.stopPropagation();
+				e.preventDefault();
+				await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+					if (Array.isArray(fm.tags)) {
+						fm.tags = fm.tags.filter((t: string) => t !== tag);
+					}
+				});
+				// Re-read tags from file to stay in sync
+				const freshTags = getFileTags(this.app, file);
+				this.renderTags(container, freshTags, file);
+			});
+		}
+		const addBtn = container.createEl("span", { cls: "four-winds-tag four-winds-tag-add", text: "+" });
+		addBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			// Replace "+" with inline select + text input
+			addBtn.style.display = "none";
+
+			const allTags = getAllVaultTags(this.app);
+			for (const t of this.plugin.settings.seedTags) {
+				if (t && !allTags.includes(t)) allTags.push(t);
+			}
+			const available = allTags.filter((t) => !tags.includes(t));
+
+			const wrapper = container.createDiv({ cls: "four-winds-tag-add-wrapper" });
+
+			const select = wrapper.createEl("select", { cls: "four-winds-tag-select" });
+			select.createEl("option", { text: "Select tag...", attr: { value: "" } });
+			for (const t of available) {
+				select.createEl("option", { text: t, attr: { value: t } });
+			}
+			select.createEl("option", { text: "— Type new —", attr: { value: "__new__" } });
+
+			const applyTag = async (val: string) => {
+				if (val) {
+					await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+						if (!fm.tags) fm.tags = [];
+						if (!Array.isArray(fm.tags)) fm.tags = [fm.tags];
+						if (!fm.tags.includes(val)) fm.tags.push(val);
+					});
+				}
+				// Re-read tags from file to stay in sync
+				const freshTags = getFileTags(this.app, file);
+				this.renderTags(container, freshTags, file);
+			};
+
+			select.addEventListener("change", () => {
+				const val = select.value;
+				if (val === "__new__") {
+					select.style.display = "none";
+					const input = wrapper.createEl("input", {
+						cls: "four-winds-tag-input",
+						attr: { type: "text", placeholder: "new tag..." },
+					});
+					input.focus();
+					const commit = () => applyTag(input.value.trim());
+					input.addEventListener("keydown", (ev) => {
+						if (ev.key === "Enter") commit();
+						if (ev.key === "Escape") this.renderTags(container, tags, file);
+					});
+					input.addEventListener("blur", commit);
+				} else if (val) {
+					applyTag(val);
+				}
+			});
+
+			select.focus();
+
+			// Cancel on Escape
+			select.addEventListener("keydown", (ev) => {
+				if (ev.key === "Escape") this.renderTags(container, tags, file);
+			});
+		});
+	}
+
+	private updateCounter() {
+		const remaining = this.cards.length - this.index;
+		this.counterEl.setText(`${this.index} of ${this.cards.length} · ${remaining} remaining`);
+	}
+
+	private swipeLeft() {
+		if (this.index >= this.cards.length) return;
+		this.cardEl.addClass("four-winds-exit-left");
+		const file = this.cards[this.index];
+		this.deletedStack.push(file);
+		setTimeout(() => {
+			this.cardEl.removeClass("four-winds-exit-left");
+			this.cardEl.style.transform = "";
+			this.cardEl.style.opacity = "";
+			this.index++;
+			this.renderCard();
+		}, 250);
+	}
+
+	private swipeRight() {
+		if (this.index >= this.cards.length) return;
+		this.cardEl.addClass("four-winds-exit-right");
+		setTimeout(() => {
+			this.cardEl.removeClass("four-winds-exit-right");
+			this.cardEl.style.transform = "";
+			this.cardEl.style.opacity = "";
+			this.index++;
+			this.renderCard();
+		}, 250);
+	}
+
+	private undo() {
+		if (this.deletedStack.length === 0) {
+			new Notice("Nothing to undo");
+			return;
+		}
+		const restored = this.deletedStack.pop()!;
+		this.cards.splice(this.index, 0, restored);
+		new Notice(`Restored "${restored.basename}"`);
+		this.renderCard();
+	}
+
+	private async moveFile() {
+		if (this.index >= this.cards.length) return;
+		const file = this.cards[this.index];
+
+		new FolderSuggestModal(this.app, async (folder: TFolder) => {
+			const newPath = `${folder.path}/${file.name}`;
+			await this.app.fileManager.renameFile(file, newPath);
+			new Notice(`Moved "${file.basename}" → ${folder.path}`);
+			this.index++;
+			this.renderCard();
+		}).open();
+	}
+
+	private async openFile() {
+		if (this.index >= this.cards.length) return;
+		const file = this.cards[this.index];
+		this.close();
+		await this.app.workspace.openLinkText(file.path, "", false);
+	}
+
+	private async processSeed() {
+		if (this.index >= this.cards.length) return;
+		const settings = this.plugin.settings;
+		const validTemplates = settings.templates.filter((t: any) => t.path);
+		console.log("[Four Winds] processSeed called, templates:", validTemplates.length);
+
+		if (validTemplates.length === 0) {
+			new Notice("No templates configured — add one in Four Winds settings");
+			return;
+		}
+
+		if (validTemplates.length === 1) {
+			await this.executeProcess(validTemplates[0]);
+		} else {
+			// Multiple templates — let user pick
+			new TemplateChooserModal(
+				this.app,
+				validTemplates.map((t: any) => t.path),
+				(chosen) => {
+					const tmpl = validTemplates.find((t: any) => t.path === chosen);
+					if (tmpl) {
+						this.executeProcess(tmpl).catch((err) => {
+							console.error("[Four Winds] executeProcess error from chooser:", err);
+							new Notice("Process failed: " + err.message);
+						});
+					}
+				}
+			).open();
+		}
+	}
+
+	private async executeProcess(template: { path: string; captureHeading: string; captureFormat: string; destinationFolder: string }) {
+		console.log("[Four Winds] executeProcess called", template.path);
+	  try {
+		const seedFile = this.cards[this.index];
+		const seedContent = await this.app.vault.cachedRead(seedFile);
+		const settings = this.plugin.settings;
+
+		// 1. Extract the seed:: capture value
+		const capture = extractSeedCapture(seedContent, settings.seedField);
+		const title = seedFile.basename;
+
+		// 2. Verify template exists
+		const templateFile = this.app.vault.getAbstractFileByPath(template.path);
+		if (!(templateFile instanceof TFile)) {
+			new Notice("Template not found: " + template.path);
+			return;
+		}
+
+		// 3. Move seed to destination folder (if configured)
+		const destFolder = template.destinationFolder || (seedFile.parent?.path ?? "");
+		let movedFile = seedFile;
+		if (destFolder && seedFile.parent?.path !== destFolder) {
+			const destFolderObj = this.app.vault.getAbstractFileByPath(destFolder);
+			if (destFolderObj instanceof TFolder) {
+				const newPath = `${destFolder}/${seedFile.name}`;
+				await this.app.fileManager.renameFile(seedFile, newPath);
+				const moved = this.app.vault.getAbstractFileByPath(newPath);
+				if (moved instanceof TFile) movedFile = moved;
+			} else {
+				new Notice(`Destination folder not found: ${destFolder}`);
+			}
+		}
+
+		// 4. Read template and replace Obsidian core template placeholders
+		let content = await this.app.vault.read(templateFile as TFile);
+		const now = (window as any).moment();
+
+		// Replace {{date:FORMAT}} placeholders (Obsidian core Templates syntax)
+		content = content.replace(/\{\{date(?::([^}]+))?\}\}/g, (_: string, fmt: string) => {
+			return now.format(fmt || "YYYY-MM-DD");
+		});
+
+		// Replace {{time:FORMAT}} placeholders
+		content = content.replace(/\{\{time(?::([^}]+))?\}\}/g, (_: string, fmt: string) => {
+			return now.format(fmt || "HH:mm");
+		});
+
+		// Replace {{title}} with the seed note's name
+		content = content.replace(/\{\{title\}\}/g, title);
+
+		// 5. Overwrite the seed file with processed template content
+		await this.app.vault.modify(movedFile, content);
+
+		// 6. If template has Templater <% %> tokens, process them
+		if (content.includes("<%")) {
+			const templater = (this.app as any).plugins.getPlugin("templater-obsidian");
+			if (templater) {
+				try {
+					await templater.templater.overwrite_file_commands(movedFile, true);
+				} catch (err) {
+					console.error("Templater processing failed:", err);
+				}
+			}
+		}
+
+		// 7. Insert capture under heading
+		if (capture && template.captureHeading) {
+			// Re-read file after Templater may have modified it
+			let finalContent = await this.app.vault.read(movedFile);
+			const heading = template.captureHeading;
+
+			const dateStr = now.format("YYYY-MM-DD");
+			const timeStr = now.format("HH:mm");
+			const formattedCapture = template.captureFormat
+				.replace(/\{title\}/g, title)
+				.replace(/\{date\}/g, dateStr)
+				.replace(/\{time\}/g, timeStr)
+				.replace(/\{capture\}/g, capture);
+
+			const headingRegex = new RegExp(`^(#{1,6}\\s+${escapeRegExpStr(heading)}.*)$`, "m");
+			const hMatch = headingRegex.exec(finalContent);
+			if (hMatch) {
+				const insertPos = hMatch.index + hMatch[0].length;
+				finalContent =
+					finalContent.slice(0, insertPos) +
+					"\n" + formattedCapture +
+					finalContent.slice(insertPos);
+				await this.app.vault.modify(movedFile, finalContent);
+			}
+		}
+
+		// 8. Close modal and open the processed note
+		this.close();
+		await this.app.workspace.openLinkText(movedFile.path, "", false);
+
+		// 9. Stella integration — directly access Stella plugin and add note to context
+		if (settings.stellaOnProcess) {
+			const stella = (this.app as any).plugins.getPlugin("stella");
+			if (stella) {
+				const leaves = this.app.workspace.getLeavesOfType("stella-mcp-chat-view");
+				if (leaves.length === 0) {
+					await stella.activateView();
+				}
+				const stellaLeaves = this.app.workspace.getLeavesOfType("stella-mcp-chat-view");
+				if (stellaLeaves.length > 0) {
+					this.app.workspace.revealLeaf(stellaLeaves[0]);
+					const chatView = stellaLeaves[0].view as any;
+					chatView.startNewConversation();
+					chatView.contextNotes = [];
+					if (chatView.addNoteToContext) {
+						await chatView.addNoteToContext(movedFile);
+					}
+				}
+			} else {
+				new Notice("Stella plugin not found");
+			}
+		}
+	  } catch (err) {
+		console.error("[Four Winds] executeProcess error:", err);
+		new Notice("Process failed: " + (err as Error).message);
+	  }
+	}
+}
+
+/*──────────────────────────────────────────────
+   Discovery Modal
+──────────────────────────────────────────────*/
+class DiscoveryModal extends Modal {
+	private plugin: FourWindsPlugin;
+	private cards: TFile[];
+	private index: number;
+	private swipeHandler: SwipeHandler | null = null;
+	private cy: cytoscape.Core | null = null;
+	private flipped = false;
+
+	private cardEl: HTMLElement;
+	private counterEl: HTMLElement;
+
+	constructor(app: any, plugin: FourWindsPlugin) {
+		super(app);
+		this.plugin = plugin;
+		this.cards = [];
+		this.index = 0;
+	}
+
+	async onOpen() {
+		const { contentEl } = this;
+		contentEl.addClass("four-winds-discovery-modal");
+		this.modalEl.addClass("four-winds-modal");
+
+		const allFiles = gatherFiles(this.app, this.plugin.settings.discoveryDirectories);
+		if (allFiles.length === 0) {
+			contentEl.createEl("p", { text: "No notes found in configured directories." });
+			return;
+		}
+		this.cards = shuffle(allFiles);
+
+		this.counterEl = contentEl.createDiv({ cls: "four-winds-counter" });
+		this.cardEl = contentEl.createDiv({ cls: "four-winds-discovery-card" });
+
+		// Direction hint labels
+		const hints = contentEl.createDiv({ cls: "four-winds-hints" });
+		hints.createEl("span", { cls: "four-winds-hint-n", text: "↑ North" });
+		hints.createEl("span", { cls: "four-winds-hint-e", text: "→ East" });
+		hints.createEl("span", { cls: "four-winds-hint-s", text: "↓ South" });
+		hints.createEl("span", { cls: "four-winds-hint-w", text: "← West" });
+
+		// Skip button
+		const actions = contentEl.createDiv({ cls: "four-winds-actions" });
+		const skipBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-skip" });
+		skipBtn.setText("Skip →");
+		skipBtn.addEventListener("click", () => this.nextCard());
+
+		await this.renderCard();
+	}
+
+	onClose() {
+		this.swipeHandler?.destroy();
+		if (this.cy) {
+			this.cy.destroy();
+			this.cy = null;
+		}
+	}
+
+	private async renderCard() {
+		if (this.index >= this.cards.length) {
+			this.cardEl.empty();
+			this.cardEl.createEl("p", { cls: "four-winds-done", text: "No more notes to discover!" });
+			this.updateCounter();
+			return;
+		}
+
+		this.cardEl.empty();
+		this.swipeHandler?.destroy();
+		if (this.cy) {
+			this.cy.destroy();
+			this.cy = null;
+		}
+		this.flipped = false;
+		this.cardEl.removeClass("four-winds-flipped");
+
+		const file = this.cards[this.index];
+		const content = await this.app.vault.cachedRead(file);
+
+		// Card inner (for 3D flip)
+		const inner = this.cardEl.createDiv({ cls: "four-winds-card-inner" });
+
+		// Front face
+		const front = inner.createDiv({ cls: "four-winds-card-face four-winds-card-front" });
+		front.createEl("h3", { text: file.basename, cls: "four-winds-card-title" });
+
+		const previewEl = front.createDiv({ cls: "four-winds-card-preview" });
+		const previewText = content;
+		await MarkdownRenderer.renderMarkdown(previewText, previewEl, file.path, this.plugin);
+
+		// Directional arrows at edges
+		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-n", text: "▲" });
+		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-e", text: "▶" });
+		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-s", text: "▼" });
+		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-w", text: "◀" });
+
+		// Back face
+		const back = inner.createDiv({ cls: "four-winds-card-face four-winds-card-back" });
+		back.createEl("h3", { text: file.basename + " — Links", cls: "four-winds-card-title" });
+		const graphContainer = back.createDiv({ cls: "four-winds-graph-container" });
+
+		// Swipe handler
+		this.swipeHandler = new SwipeHandler({
+			el: this.cardEl,
+			horizontalOnly: false,
+			onSwipe: (dir) => this.handleSwipe(dir, file),
+			onTap: () => this.flipCard(inner, graphContainer, file, content),
+			onMove: (dx, dy) => {
+				if (!this.flipped) {
+					this.cardEl.style.transform = `translate(${dx}px, ${dy}px)`;
+					this.cardEl.style.opacity = `${1 - (Math.abs(dx) + Math.abs(dy)) / 600}`;
+				}
+			},
+		});
+
+		this.updateCounter();
+	}
+
+	private flipCard(inner: HTMLElement, graphContainer: HTMLElement, file: TFile, content: string) {
+		this.flipped = !this.flipped;
+		if (this.flipped) {
+			this.cardEl.addClass("four-winds-flipped");
+			// Render cytoscape after flip transition
+			const handler = () => {
+				inner.removeEventListener("transitionend", handler);
+				this.renderMiniGraph(graphContainer, file, content);
+			};
+			inner.addEventListener("transitionend", handler);
+		} else {
+			this.cardEl.removeClass("four-winds-flipped");
+			if (this.cy) {
+				this.cy.destroy();
+				this.cy = null;
+			}
+		}
+	}
+
+	private async renderMiniGraph(container: HTMLElement, file: TFile, content: string) {
+		container.empty();
+		const width = container.clientWidth || 300;
+		const height = container.clientHeight || 250;
+		const centerX = width / 2;
+		const centerY = height / 2;
+
+		const nodes: cytoscape.ElementDefinition[] = [
+			{
+				data: { id: "center", label: file.basename, type: "central" },
+				position: { x: centerX, y: centerY },
+			},
+		];
+		const edges: cytoscape.ElementDefinition[] = [];
+
+		const directions = ["north", "east", "south", "west"];
+		const dirColors: Record<string, string> = {
+			north: "#607c87",
+			east: "#76b12b",
+			south: "#c7b194",
+			west: "#f0533f",
+		};
+		const dirOffsets: Record<string, { x: number; y: number }> = {
+			north: { x: 0, y: -80 },
+			east: { x: 100, y: 0 },
+			south: { x: 0, y: 80 },
+			west: { x: -100, y: 0 },
+		};
+
+		let nodeIdx = 0;
+		for (const dir of directions) {
+			const dirRegex = new RegExp("```ad-" + dir + "\\n([\\s\\S]*?)```", "gm");
+			const matches = Array.from(content.matchAll(dirRegex));
+			for (const m of matches) {
+				const linkRegex = /\[\[(.*?)\]\]/g;
+				let lm;
+				while ((lm = linkRegex.exec(m[1])) !== null) {
+					const linkName = lm[1].trim().replace(/\.md$/i, "");
+					const nid = `n${nodeIdx++}`;
+					const spread = (nodeIdx % 3 - 1) * 30;
+					nodes.push({
+						data: { id: nid, label: linkName, type: "branch", direction: dir },
+						position: {
+							x: centerX + dirOffsets[dir].x + spread,
+							y: centerY + dirOffsets[dir].y + (dir === "east" || dir === "west" ? spread : 0),
+						},
+					});
+					edges.push({
+						data: { source: "center", target: nid },
+					});
+				}
+			}
+		}
+
+		this.cy = cytoscapeFn({
+			container,
+			elements: [...nodes, ...edges],
+			style: [
+				{
+					selector: 'node[type="central"]',
+					style: {
+						"background-color": "#c7b194",
+						width: "20px",
+						height: "20px",
+						label: "data(label)",
+						"font-size": "10px",
+						"text-valign": "bottom",
+						"text-margin-y": 8,
+						color: "#fff",
+					},
+				},
+				{
+					selector: 'node[type="branch"]',
+					style: {
+						"background-color": (ele: any) => dirColors[ele.data("direction")] || "#999",
+						width: "12px",
+						height: "12px",
+						label: "data(label)",
+						"font-size": "9px",
+						"text-valign": "bottom",
+						"text-margin-y": 6,
+						color: "#fff",
+					},
+				},
+				{
+					selector: "edge",
+					style: {
+						width: "1px",
+						"line-color": "#917959",
+						"target-arrow-shape": "triangle",
+						"target-arrow-color": "#917959",
+						"curve-style": "bezier",
+						opacity: 0.6,
+					},
+				},
+			],
+			layout: { name: "preset" },
+			userPanningEnabled: false,
+			userZoomingEnabled: false,
+			boxSelectionEnabled: false,
+		});
+	}
+
+	private directionMap: Record<SwipeDirection, string> = {
+		up: "north",
+		right: "east",
+		down: "south",
+		left: "west",
+	};
+
+	private oppositeMap: Record<string, string> = {
+		north: "south",
+		south: "north",
+		east: "west",
+		west: "east",
+	};
+
+	private async handleSwipe(dir: SwipeDirection, file: TFile) {
+		const compassDir = this.directionMap[dir];
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice("No active file to add link to");
+			this.nextCard();
+			return;
+		}
+
+		// Animate exit
+		const exitClass = `four-winds-exit-${dir}`;
+		this.cardEl.addClass(exitClass);
+
+		// Add link to active file's ad-{direction} block
+		await addLinkToDirection(this.app, activeFile.path, file.basename, compassDir);
+
+		// Auto-link: add reverse link in discovered note
+		if (this.plugin.settings.autoLink) {
+			const reverseDir = this.oppositeMap[compassDir];
+			await addLinkToDirection(this.app, file.path, activeFile.basename, reverseDir);
+		}
+
+		new Notice(`Linked [[${file.basename}]] as ${compassDir}`);
+
+		setTimeout(() => {
+			this.cardEl.removeClass(exitClass);
+			this.cardEl.style.transform = "";
+			this.cardEl.style.opacity = "";
+			this.index++;
+			this.renderCard();
+		}, 300);
+	}
+
+	private nextCard() {
+		this.index++;
+		this.cardEl.style.transform = "";
+		this.cardEl.style.opacity = "";
+		this.renderCard();
+	}
+
+	private updateCounter() {
+		const remaining = this.cards.length - this.index;
+		this.counterEl.setText(`${this.index + 1} of ${this.cards.length} · ${remaining} remaining`);
+	}
+}
+
+/*──────────────────────────────────────────────
+   1) CompassView (existing)
+──────────────────────────────────────────────*/
+class CompassView extends ItemView {
+	static VIEW_TYPE = "compass-view";
+
+	private plugin: FourWindsPlugin;
+	private renderTimeout: number | null = null;
+
+	constructor(leaf: WorkspaceLeaf, plugin: FourWindsPlugin) {
+		super(leaf);
+		this.plugin = plugin;
+	}
+
+	getIcon(): string {
+		return "compass";
+	}
+
+	getViewType(): string {
+		return CompassView.VIEW_TYPE;
+	}
+
+	getDisplayText(): string {
+		return "Compass";
+	}
+
+	async onOpen(): Promise<void> {
+		this.render();
+		this.registerEvent(
+			this.app.workspace.on("file-open", () => this.handleFileOpen())
+		);
+	}
+
+	async onClose(): Promise<void> {
+		this.cleanupRenderTimeout();
+	}
+
+	handleFileOpen() {
+		this.cleanupRenderTimeout();
+		this.renderTimeout = window.setTimeout(() => {
+			this.render();
+		}, 300);
+	}
+
+	cleanupRenderTimeout() {
+		if (this.renderTimeout) {
+			clearTimeout(this.renderTimeout);
+			this.renderTimeout = null;
+		}
+	}
+
+	async render() {
+		const container = this.containerEl.children[1];
+		container.empty();
+
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			container.createEl("p", { text: "No active note selected." });
+			return;
+		}
+
+		try {
+			const content = await this.app.vault.cachedRead(activeFile);
+			if (!content || content.trim().length === 0) {
+				container.createEl("p", { text: "The selected note has no content." });
+				return;
+			}
+
+			const directions = ["north", "south", "east", "west"];
+
+			const directionLinks: Record<string, Set<string>> = {
+				north: new Set(),
+				south: new Set(),
+				east: new Set(),
+				west: new Set(),
+			};
+
+			await Promise.all(
+				directions.map(async (dir) => {
+					if (dir === "north") {
+						const dynamicLinks = await this.fetchDynamicLinks("ad-south", activeFile.name);
+						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
+					} else if (dir === "south") {
+						const dynamicLinks = await this.fetchDynamicLinks("ad-north", activeFile.name);
+						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
+					} else if (dir === "east") {
+						const dynamicLinks = await this.fetchDynamicLinks("ad-east", activeFile.name);
+						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
+					} else if (dir === "west") {
+						const dynamicLinks = await this.fetchDynamicLinks("ad-west", activeFile.name);
+						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
+					}
+				})
+			);
+
+			directions.forEach((dir) => {
+				const section = container.createEl("div", { cls: "compass-section" });
+				section.createEl("h6", { text: dir.toLowerCase() });
+
+				const hardcodedLinks = this.extractHardcodedLinks(dir, content);
+				hardcodedLinks.forEach((link) => directionLinks[dir].add(link));
+
+				const allLinks = Array.from(directionLinks[dir]);
+				if (allLinks.length > 0) {
+					allLinks.forEach((link) => {
+						const linkEl = section.createEl("p");
+						linkEl.createEl("a", {
+							text: link,
+							href: `obsidian://open?vault=${this.app.vault.getName()}&file=${encodeURIComponent(
+								link
+							)}`,
+						});
+					});
+				} else {
+					section.createEl("p", { text: "..." });
+				}
+			});
+
+			console.log("Compass View rendered successfully.");
+		} catch (error) {
+			console.error("Error rendering CompassView:", error);
+		}
+	}
+
+	private extractHardcodedLinks(direction: string, content: string): string[] {
+		const regex = new RegExp(`\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``, "gm");
+		const matches = Array.from(content.matchAll(regex));
+		const links: string[] = [];
+		for (const match of matches) {
+			const sectionContent = match[1];
+			const linkRegex = /\[\[(.*?)\]\]/g;
+			const sectionLinks = Array.from(sectionContent.matchAll(linkRegex), (m) => m[1]);
+			links.push(...sectionLinks);
+		}
+		return links;
+	}
+
+	private async fetchDynamicLinks(admonitionType: string, currentFile: string): Promise<string[]> {
+		try {
+			const dv = this.app.plugins.getPlugin("dataview");
+			if (!dv) throw new Error("Dataview plugin is not enabled or not available.");
+
+			const allNotes = dv.api.pages();
+			const result = new Set<string>();
+
+			for (const note of allNotes) {
+				const content = (await dv.api.io.load(note.file.path)) || "";
+
+				const regex = new RegExp(
+					`\`\`\`${admonitionType}[\\s\\S]*?\\[\\[${currentFile}\\]\\][\\s\\S]*?\`\`\``,
+					"gm"
+				);
+				const matches = content.match(regex);
+
+				if (matches) {
+					result.add(note.file.name);
+				}
+			}
+
+			return Array.from(result).sort();
+		} catch (error) {
+			console.error("Error fetching dynamic links:", error);
+			return [];
+		}
+	}
+}
+
+/*──────────────────────────────────────────────
+   2) NavigationView
+──────────────────────────────────────────────*/
+export class NavigationView extends ItemView {
 	static VIEW_TYPE = "navigation-view";
-	plugin: CompassPlugin; // reusing your existing plugin instance
+	plugin: FourWindsPlugin;
 	cy: cytoscape.Core | null = null;
 
-	constructor(leaf: WorkspaceLeaf, plugin: CompassPlugin) {
+	constructor(leaf: WorkspaceLeaf, plugin: FourWindsPlugin) {
 		super(leaf);
 		this.plugin = plugin;
 	}
@@ -211,9 +1472,8 @@ class NavigationView extends ItemView {
 	}
 
 	async onOpen() {
-		// Re-render whenever a new file is opened.
 		this.registerEvent(this.app.workspace.on("file-open", () => this.render()));
-		this.render();
+		await this.render();
 	}
 
 	async onClose() {
@@ -223,379 +1483,1146 @@ class NavigationView extends ItemView {
 		}
 	}
 
-	/**
-	 * Renders the Navigation View using Cytoscape.js.
-	 *
-	 * - Creates a Cytoscape container inside this.contentEl.
-	 * - Displays a central node representing the active note (with its trailing ".md" removed).
-	 * - For each admonition direction ("north", "east", "south", "west"),
-	 *   extracts first-degree branch nodes and positions them relative to the central node.
-	 * - Connects each branch node to the central node via an edge.
-	 * - For each branch node, loads its note and extracts secondary links (2nd-degree nodes)
-	 *   positioned relative to the branch node (as if it were a new center).
-	 * - Secondary nodes are styled with very low default opacity.
-	 * - Panning, zooming, and dragging are enabled.
-	 * - Hovering over any node lowers the opacity of all nodes except the hovered node and its immediate neighbors.
-	 */
+	escapeRegExp(str: string): string {
+		return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+
+	getOppositeDirection(dir: string): string {
+		switch (dir.toLowerCase()) {
+			case "north": return "south";
+			case "south": return "north";
+			case "east": return "west";
+			case "west": return "east";
+			default: return dir;
+		}
+	}
+
+	async checkMutualConnection(
+		firstNoteName: string,
+		secondNoteName: string,
+		direction: string
+	): Promise<boolean> {
+		if (direction.toLowerCase() !== "east" && direction.toLowerCase() !== "west") {
+			return false;
+		}
+
+		try {
+			const firstFile = this.app.metadataCache.getFirstLinkpathDest(firstNoteName, "");
+			const secondFile = this.app.metadataCache.getFirstLinkpathDest(secondNoteName, "");
+
+			if (!firstFile || !secondFile) {
+				return false;
+			}
+
+			const cleanFirst = firstNoteName.toLowerCase().replace(/\.md$/i, "");
+
+			const secondContent = await this.app.vault.cachedRead(secondFile);
+
+			const sameDir = direction.toLowerCase();
+
+			const blockRegex = new RegExp(`\`\`\`ad-${sameDir}\\n([\\s\\S]*?)\`\`\``, "i");
+			const match = blockRegex.exec(secondContent);
+
+			if (!match || !match[1]) {
+				return false;
+			}
+
+			const blockContent = match[1];
+			const escapedName = this.escapeRegExp(cleanFirst);
+			const linkRegex = new RegExp(`\\[\\[(${escapedName}|${escapedName}\\.md)\\]\\]`, "i");
+
+			return linkRegex.test(blockContent);
+		} catch (error) {
+			console.error("Error checking mutual connection:", error);
+			return false;
+		}
+	}
+
+	calculateNodePositions(
+		direction: string,
+		nodeCount: number,
+		centerX: number,
+		centerY: number,
+		containerWidth: number,
+		containerHeight: number,
+		labels?: string[]
+	): Array<{ x: number; y: number }> {
+		const positions: Array<{ x: number; y: number }> = [];
+		const dir = direction.toLowerCase();
+		const isLateral = dir === "east" || dir === "west";
+
+		// Label dimensions
+		const charWidth = 7;
+		const labelHeight = 22;
+		const labelWidths = labels
+			? labels.map((l) => l.length * charWidth + 16)
+			: Array(nodeCount).fill(60);
+
+		const halfW = containerWidth / 2;
+		const halfH = containerHeight / 2;
+
+		if (isLateral) {
+			// East/West: nodes must stay firmly in their horizontal half
+			// Primary axis = x (pushed out east or west)
+			// Secondary axis = y (spread vertically, but clamped near center)
+			const xSign = dir === "east" ? 1 : -1;
+
+			// X: strongly pushed into their half — 40% to 80% of halfW
+			const xBase = halfW * 0.45;
+			const xRange = halfW * 0.35;
+
+			// Y: spread vertically but stay within ±40% of halfH from center
+			const yLimit = halfH * 0.4;
+			const rowGap = Math.max(labelHeight, (yLimit * 2) / Math.max(1, nodeCount));
+
+			const startY = centerY - ((nodeCount - 1) * rowGap) / 2;
+
+			for (let i = 0; i < nodeCount; i++) {
+				// Stagger x outward: alternate near/far
+				const xDepth = nodeCount <= 1 ? 0.5
+					: (i % 2 === 0 ? 0.2 : 0.8);
+				const x = centerX + xSign * (xBase + xDepth * xRange);
+
+				// Y evenly spaced
+				const y = startY + i * rowGap;
+
+				positions.push({ x, y });
+			}
+		} else {
+			// North/South: nodes must stay firmly in their vertical half
+			// Primary axis = y (pushed up or down)
+			// Secondary axis = x (spread horizontally, clamped near center)
+			const ySign = dir === "south" ? 1 : -1;
+
+			// Y: strongly pushed into their half — 40% to 80% of halfH
+			const yBase = halfH * 0.45;
+			const yRange = halfH * 0.35;
+
+			// X: spread horizontally but stay within ±40% of halfW from center
+			const xLimit = halfW * 0.4;
+			const totalWidth = labelWidths.reduce((s, w) => s + w, 0);
+			const availW = xLimit * 2;
+			const gap = Math.max(8, (availW - totalWidth) / Math.max(1, nodeCount - 1));
+
+			let currentX = centerX - (totalWidth + gap * (nodeCount - 1)) / 2;
+
+			for (let i = 0; i < nodeCount; i++) {
+				const x = currentX + labelWidths[i] / 2;
+				currentX += labelWidths[i] + gap;
+
+				// Stagger y depth: alternate near/far
+				const yDepth = nodeCount <= 1 ? 0.5
+					: (i % 2 === 0 ? 0.2 : 0.8);
+				const y = centerY + ySign * (yBase + yDepth * yRange);
+
+				positions.push({ x, y });
+			}
+		}
+
+		return positions;
+	}
+
 	async render() {
-		// Use the view's content element.
 		const container = this.contentEl;
 		container.empty();
 
-		// Destroy any existing Cytoscape instance.
 		if (this.cy) {
 			this.cy.destroy();
 			this.cy = null;
 		}
 
-		// Get the active file.
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			container.createEl("p", { text: "No active note selected." });
 			return;
 		}
 
-		// Create a container div for Cytoscape.
 		const cyContainer = container.createDiv({ cls: "navigation-cy-container" });
 		cyContainer.style.width = "100%";
 		cyContainer.style.height = "100%";
 
-		// Extract the file name: remove trailing ".md" only.
-		let fileName = activeFile.name;
-		if (fileName.toLowerCase().endsWith(".md")) {
-			fileName = fileName.slice(0, -3);
-		}
-
-		// Compute center positions based on container dimensions.
+		const fileName = activeFile.name.replace(/\.md$/i, "");
 		const width = cyContainer.clientWidth || 600;
 		const height = cyContainer.clientHeight || 400;
 		const centerX = width / 2;
 		const centerY = height / 2;
 
-		// Build arrays for nodes and edges.
-		let nodes: cytoscape.ElementDefinition[] = [];
-		let edges: cytoscape.ElementDefinition[] = [];
+		const nodes: cytoscape.ElementDefinition[] = [];
+		const edges: cytoscape.ElementDefinition[] = [];
 
-		// Create the central node (color: #c7b194).
 		nodes.push({
 			data: { id: "central", label: fileName, type: "central" },
-			position: { x: centerX, y: centerY }
+			position: { x: centerX, y: centerY },
 		});
 
-		// Read the active file's content.
 		const content = await this.app.vault.cachedRead(activeFile);
+		if (!content) {
+			container.createEl("p", { text: "This note is empty or unreadable." });
+			return;
+		}
 
-		// Process the four admonition directions for first-degree branch nodes.
 		const directions = ["north", "east", "south", "west"];
-		const offsetConfig: Record<string, { baseOffset: number; spacing: number; isVertical: boolean; sign: number }> = {
-			north: { baseOffset: 150, spacing: 50, isVertical: false, sign: -1 },
-			south: { baseOffset: 150, spacing: 50, isVertical: false, sign: 1 },
-			east:  { baseOffset: 150, spacing: 50, isVertical: true,  sign: 1 },
-			west:  { baseOffset: 150, spacing: 50, isVertical: true,  sign: -1 }
-		};
 
-		directions.forEach((dir) => {
-			const regex = new RegExp("```ad-" + dir + "\\n([\\s\\S]*?)```", "gm");
-			let branchLinks: string[] = [];
-			let match;
-			while ((match = regex.exec(content)) !== null) {
-				const admonitionContent = match[1];
+		const addedFiles = new Map<string, { nodeId: string; direction: string }>();
+		const centerNameLC = fileName.toLowerCase();
+
+		for (const dir of directions) {
+			const dirRegex = new RegExp(`\`\`\`ad-${dir}\\n([\\s\\S]*?)\`\`\``, "gm");
+			const matches = Array.from(content.matchAll(dirRegex));
+			if (!matches.length) continue;
+
+			const directionLinks: string[] = [];
+			for (const m of matches) {
+				const blockContent = m[1];
 				const linkRegex = /\[\[(.*?)\]\]/g;
 				let linkMatch;
-				while ((linkMatch = linkRegex.exec(admonitionContent)) !== null) {
-					let linkName = linkMatch[1].trim();
-					if (linkName.toLowerCase().endsWith(".md")) {
-						linkName = linkName.slice(0, -3);
-					}
-					branchLinks.push(linkName);
+				while ((linkMatch = linkRegex.exec(blockContent)) !== null) {
+					let linkName = linkMatch[1].trim().replace(/\.md$/i, "");
+
+					if (linkName.toLowerCase() === centerNameLC) continue;
+
+					directionLinks.push(linkName);
 				}
 			}
-			if (branchLinks.length > 0) {
-				branchLinks.forEach((link, i) => {
-					let posX = centerX;
-					let posY = centerY;
-					const config = offsetConfig[dir];
-					if (config.isVertical) {
-						posX = centerX + config.baseOffset * config.sign;
-						posY = centerY + (i - (branchLinks.length - 1) / 2) * config.spacing;
-					} else {
-						posY = centerY + config.baseOffset * config.sign;
-						posX = centerX + (i - (branchLinks.length - 1) / 2) * config.spacing;
-					}
-					const nodeId = `${dir}_${i}`;
-					nodes.push({
-						data: { id: nodeId, label: link, type: "branch", direction: dir },
-						position: { x: posX, y: posY }
-					});
-					edges.push({
-						data: { id: `edge_${dir}_${i}`, source: "central", target: nodeId }
-					});
-				});
-			}
-		});
 
-		// Initialize Cytoscape with first-degree nodes.
+			const uniqueLinks = [...new Set(directionLinks)];
+			if (!uniqueLinks.length) continue;
+
+			const positions = this.calculateNodePositions(
+				dir,
+				uniqueLinks.length,
+				centerX,
+				centerY,
+				width,
+				height,
+				uniqueLinks
+			);
+
+			uniqueLinks.forEach((link, i) => {
+				const linkLC = link.toLowerCase();
+
+				if (addedFiles.has(linkLC)) return;
+
+				const nodeId = `${dir}_${i}`;
+				addedFiles.set(linkLC, { nodeId, direction: dir });
+
+				nodes.push({
+					data: {
+						id: nodeId,
+						label: link,
+						type: "branch",
+						direction: dir,
+						fileName: link,
+					},
+					position: positions[i],
+				});
+
+				edges.push({
+					data: {
+						id: `edge_${nodeId}`,
+						source: "central",
+						target: nodeId,
+						isMutual: false,
+					},
+				});
+			});
+		}
+
+		const mutualEdges = new Set<string>();
+
+		for (const [linkLC, { nodeId, direction }] of addedFiles.entries()) {
+			if (direction.toLowerCase() === "east" || direction.toLowerCase() === "west") {
+				const isMutual = await this.checkMutualConnection(
+					fileName,
+					linkLC,
+					direction
+				);
+
+				if (isMutual) {
+					mutualEdges.add(`edge_${nodeId}`);
+				}
+			}
+		}
+
+		for (const edge of edges) {
+			const edgeId = edge.data.id as string;
+			edge.data.isMutual = mutualEdges.has(edgeId);
+		}
+
 		this.cy = cytoscapeFn({
 			container: cyContainer,
-			elements: [
-				...nodes,
-				...edges
-			],
+			elements: [...nodes, ...edges],
 			style: [
 				{
 					selector: 'node[type="central"]',
 					style: {
-						'background-color': '#c7b194',
-						'width': '30px',
-						'height': '30px',
-						'label': 'data(label)',
-						'text-valign': 'bottom',
-						'text-halign': 'center',
-						'text-margin-y': 8,
-						'font-size': '12px',
-						'color': '#fff'
-					}
+						"background-color": "#c7b194",
+						width: "30px",
+						height: "30px",
+						label: "data(label)",
+						"text-valign": "bottom",
+						"text-halign": "center",
+						"text-margin-y": 10,
+						"font-size": "14px",
+						"font-weight": "bold",
+						color: "#fff",
+					},
 				},
 				{
 					selector: 'node[type="branch"][direction="north"]',
 					style: {
-						'background-color': '#607c87',
-						'width': '15px',
-						'height': '15px',
-						'label': 'data(label)',
-						'text-valign': 'bottom',
-						'text-halign': 'center',
-						'text-margin-y': 8,
-						'font-size': '10px',
-						'color': '#fff'
-					}
+						"background-color": "#607c87",
+						width: "15px",
+						height: "15px",
+						label: "data(label)",
+						"text-valign": "top",
+						"text-halign": "center",
+						"text-margin-y": -10,
+						"font-size": "12px",
+						color: "#fff",
+					},
 				},
 				{
 					selector: 'node[type="branch"][direction="east"]',
 					style: {
-						'background-color': '#76b12b',
-						'width': '15px',
-						'height': '15px',
-						'label': 'data(label)',
-						'text-valign': 'bottom',
-						'text-halign': 'center',
-						'text-margin-y': 8,
-						'font-size': '10px',
-						'color': '#fff'
-					}
+						"background-color": "#76b12b",
+						width: "15px",
+						height: "15px",
+						label: "data(label)",
+						"text-valign": "bottom",
+						"text-halign": "center",
+						"text-margin-y": 10,
+						"font-size": "12px",
+						color: "#fff",
+					},
 				},
 				{
 					selector: 'node[type="branch"][direction="south"]',
 					style: {
-						'background-color': '#c7b194',
-						'width': '15px',
-						'height': '15px',
-						'label': 'data(label)',
-						'text-valign': 'bottom',
-						'text-halign': 'center',
-						'text-margin-y': 8,
-						'font-size': '10px',
-						'color': '#fff'
-					}
+						"background-color": "#c7b194",
+						width: "15px",
+						height: "15px",
+						label: "data(label)",
+						"text-valign": "bottom",
+						"text-halign": "center",
+						"text-margin-y": 10,
+						"font-size": "12px",
+						color: "#fff",
+					},
 				},
 				{
 					selector: 'node[type="branch"][direction="west"]',
 					style: {
-						'background-color': '#f0533f',
-						'width': '15px',
-						'height': '15px',
-						'label': 'data(label)',
-						'text-valign': 'bottom',
-						'text-halign': 'center',
-						'text-margin-y': 8,
-						'font-size': '10px',
-						'color': '#fff'
-					}
+						"background-color": "#f0533f",
+						width: "15px",
+						height: "15px",
+						label: "data(label)",
+						"text-valign": "top",
+						"text-halign": "center",
+						"text-margin-y": -10,
+						"font-size": "12px",
+						color: "#fff",
+					},
 				},
 				{
 					selector: 'node[type="secondary"]',
 					style: {
-						'background-color': '#999999',
-						'width': '10px',
-						'height': '10px',
-						'label': 'data(label)',
-						'text-valign': 'bottom',
-						'text-halign': 'center',
-						'text-margin-y': 5,
-						'font-size': '8px',
-						'color': '#fff',
-						'opacity': 0.1 // Default low opacity
-					}
+						"background-color": "#999999",
+						width: "10px",
+						height: "10px",
+						label: "data(label)",
+						"text-valign": "bottom",
+						"text-halign": "center",
+						"text-margin-y": 7,
+						"font-size": "10px",
+						color: "#fff",
+						opacity: 0.2,
+					},
 				},
 				{
-					selector: 'edge',
+					selector: 'node[type="tertiary"]',
 					style: {
-						'width': '1px',
-						'line-color': '#917959',
-						'target-arrow-shape': 'triangle',
-						'target-arrow-color': '#917959',
-						'curve-style': 'bezier'
-					}
-				}
+						"background-color": "#666666",
+						width: "8px",
+						height: "8px",
+						label: "data(label)",
+						"text-valign": "bottom",
+						"text-halign": "center",
+						"text-margin-y": 5,
+						"font-size": "8px",
+						color: "#fff",
+						opacity: 0,
+						visibility: "hidden",
+					},
+				},
+				{
+					selector: "edge",
+					style: {
+						width: "0.5px",
+						"line-color": "#917959",
+						"target-arrow-shape": "none",
+						"source-arrow-shape": "none",
+						"curve-style": "bezier",
+						opacity: 0.5,
+					},
+				},
+				{
+					selector: 'edge[isMutual = true]',
+					style: {
+						width: "0.5px",
+						"line-color": "#917959",
+						"target-arrow-shape": "triangle",
+						"target-arrow-color": "#917959",
+						"source-arrow-shape": "triangle",
+						"source-arrow-color": "#917959",
+						"arrow-scale": 0.6,
+						"curve-style": "bezier",
+						opacity: 0.6,
+					},
+				},
 			],
-			layout: { name: 'preset' },
+			layout: { name: "preset" },
 			userPanningEnabled: true,
 			userZoomingEnabled: true,
-			boxSelectionEnabled: false
+			boxSelectionEnabled: false,
+			wheelSensitivity: 0.3,
 		});
 
-		// Enable node dragging.
-		this.cy!.nodes().grabify();
+		if (this.cy) {
+			this.cy.nodes().grabify();
+		}
 
-		// Attach click events to nodes.
-		this.cy!.on('tap', 'node', (event: cytoscape.EventObject) => {
-			const node = event.target;
-			const data = node.data();
-			if (data.type === "central") {
-				this.app.workspace.openLinkText(activeFile.name, "");
-			} else if (data.type === "branch" || data.type === "secondary") {
-				this.app.workspace.openLinkText(data.label, "");
-			}
-		});
+		if (this.cy) {
+			this.cy.on("tap", "node", (evt) => {
+				const node = evt.target;
+				const data = node.data();
 
-		// Hover interaction: on mouseover, reduce opacity of all elements except the hovered node and its neighborhood.
-		this.cy!.on('mouseover', 'node', (event: cytoscape.EventObject) => {
-			const node = event.target;
-			this.cy!.elements().style('opacity', 0.2);
-			node.style('opacity', 1);
-			node.connectedEdges().style('opacity', 1);
-			node.neighborhood().style('opacity', 1);
-		});
-		// On mouseout, restore opacity for all nodes—but secondary nodes go back to low opacity.
-		this.cy!.on('mouseout', 'node', (event: cytoscape.EventObject) => {
-			this.cy!.nodes().forEach(n => {
-				if(n.data('type') === 'secondary'){
-					n.style('opacity', 0.1);
+				if (data.type === "central") {
+					this.app.workspace.openLinkText(activeFile.name, "");
 				} else {
-					n.style('opacity', 1);
+					const fileName = data.fileName || data.label || "";
+					this.app.workspace.openLinkText(fileName, "");
 				}
 			});
-			this.cy!.edges().style('opacity', 1);
-		});
 
-		// For each branch node, process its note to add secondary (2nd degree) nodes.
-		this.cy!.nodes('[type="branch"]').forEach((branchNode: cytoscape.NodeSingular) => {
-			this.processBranchNode(branchNode);
-		});
+			this.cy.on("mouseover", "node", (evt) => {
+				if (!this.cy) return;
+				const node = evt.target;
+				const nodeData = node.data();
+
+				this.cy.elements().style("opacity", 0.2);
+				node.style("opacity", 1);
+				node.connectedEdges().style("opacity", 0.8);
+				node.neighborhood().style("opacity", 1);
+
+				if (nodeData.type === "secondary") {
+					this.cy.nodes('[type="tertiary"]')
+						.style("visibility", "hidden")
+						.style("opacity", 0);
+					this.loadTertiaryNodes(node);
+				}
+			});
+
+			this.cy.on("mouseout", "node", (evt) => {
+				if (!this.cy) return;
+				const node = evt.target;
+				const nodeData = node.data();
+
+				this.cy.nodes().forEach((n) => {
+					const nData = n.data();
+					if (nData.type === "secondary") {
+						n.style("opacity", 0.2);
+					} else if (nData.type === "tertiary") {
+						if (nodeData.type !== "secondary" || nodeData.id !== nData.parentId) {
+							n.style("visibility", "hidden").style("opacity", 0);
+						}
+					} else {
+						n.style("opacity", 1);
+					}
+				});
+				this.cy.edges().style("opacity", 0.7);
+				this.cy.edges('[isMutual = true]').style("opacity", 0.8);
+			});
+		}
+
+		if (this.cy) {
+			const branchNodes = Array.from(this.cy.nodes('[type="branch"]'));
+			for (const branchNode of branchNodes) {
+				await this.processBranchNode(branchNode);
+			}
+		}
+
 	}
 
-	/**
-	 * Processes a branch node by loading its note content and adding secondary nodes.
-	 * Secondary nodes are arranged relative to the branch node as if it were a new center,
-	 * and are added with low default opacity.
-	 */
 	async processBranchNode(branchNode: cytoscape.NodeSingular): Promise<void> {
-		const branchData = branchNode.data();
-		const branchNoteName = branchData.label;
-		const branchDirection = branchData.direction;
-		// Locate the note from the vault.
-		const branchFile = this.app.metadataCache.getFirstLinkpathDest(branchNoteName, "");
-		if (branchFile) {
-			const branchContent = await this.app.vault.cachedRead(branchFile);
-			// Look for the admonition block for the branch's direction.
-			const regex = new RegExp("```ad-" + branchDirection + "\\n([\\s\\S]*?)```", "gm");
-			const match = regex.exec(branchContent);
-			if (match) {
-				const admonitionContent = match[1];
-				const linkRegex = /\[\[(.*?)\]\]/g;
-				let linkMatch;
-				let secondaryLinks: string[] = [];
-				while ((linkMatch = linkRegex.exec(admonitionContent)) !== null) {
-					let secLink = linkMatch[1].trim();
-					if (secLink.toLowerCase().endsWith(".md")) {
-						secLink = secLink.slice(0, -3);
-					}
-					secondaryLinks.push(secLink);
+		if (!this.cy) return;
+
+		const data = branchNode.data();
+		const direction = data.direction as string;
+		const branchNoteName = (data.fileName as string) ?? (data.label as string);
+
+		if (!branchNoteName || !direction) return;
+
+		const file = this.app.metadataCache.getFirstLinkpathDest(branchNoteName, "");
+		if (!file) return;
+
+		try {
+			const content = await this.app.vault.cachedRead(file);
+			const dirRegex = new RegExp(`\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``, "gm");
+			const match = dirRegex.exec(content);
+			if (!match) return;
+
+			const blockContent = match[1];
+			const linkRegex = /\[\[(.*?)\]\]/g;
+			const secondaryLinks: string[] = [];
+			let linkMatch: RegExpExecArray | null;
+
+			while ((linkMatch = linkRegex.exec(blockContent)) !== null) {
+				let secLink = linkMatch[1].trim();
+				if (secLink.toLowerCase().endsWith(".md")) {
+					secLink = secLink.slice(0, -3);
 				}
-				// Position secondary nodes relative to the branch node.
-				const branchPos = branchNode.position();
-				// Configuration for secondary nodes (using the branch node as center).
-				const secondaryOffsetConfig: Record<string, { baseOffset: number; spacing: number; isVertical: boolean; sign: number }> = {
-					north: { baseOffset: 100, spacing: 30, isVertical: false, sign: -1 },
-					south: { baseOffset: 100, spacing: 30, isVertical: false, sign: 1 },
-					east:  { baseOffset: 100, spacing: 30, isVertical: true,  sign: 1 },
-					west:  { baseOffset: 100, spacing: 30, isVertical: true,  sign: -1 }
-				};
-				const secConfig = secondaryOffsetConfig[branchDirection];
-				secondaryLinks.forEach((secLink, i) => {
-					let secX = branchPos.x;
-					let secY = branchPos.y;
-					if (secConfig.isVertical) {
-						secX = branchPos.x + secConfig.baseOffset * secConfig.sign;
-						secY = branchPos.y + (i - (secondaryLinks.length - 1) / 2) * secConfig.spacing;
-					} else {
-						secY = branchPos.y + secConfig.baseOffset * secConfig.sign;
-						secX = branchPos.x + (i - (secondaryLinks.length - 1) / 2) * secConfig.spacing;
-					}
-					const secNodeId = branchData.id + "_sec_" + i;
-					// Add secondary node without a parent, so it is independent.
-					this.cy!.add({
-						group: 'nodes',
-						data: { id: secNodeId, label: secLink, type: "secondary" },
-						position: { x: secX, y: secY }
-					});
-					this.cy!.add({
-						group: 'edges',
-						data: { id: secNodeId + "_edge", source: branchData.id, target: secNodeId }
-					});
-				});
+				if (secLink.toLowerCase() === branchNoteName.toLowerCase()) continue;
+				secondaryLinks.push(secLink);
 			}
+
+			if (!secondaryLinks.length) return;
+			const uniqueLinks = [...new Set(secondaryLinks)];
+
+			const branchPos = branchNode.position();
+			const scale = 0.6;
+			const posArray = this.calculateNodePositions(
+				direction,
+				uniqueLinks.length,
+				branchPos.x,
+				branchPos.y,
+				this.cy.width() * scale,
+				this.cy.height() * scale,
+				uniqueLinks
+			);
+
+			const addedSecondary = new Set<string>();
+
+			uniqueLinks.forEach((sec, i) => {
+				const secLC = sec.toLowerCase();
+				if (addedSecondary.has(secLC)) return;
+				addedSecondary.add(secLC);
+
+				const secNodeId = data.id + "_sec_" + i;
+				this.cy?.add({
+					group: "nodes",
+					data: {
+						id: secNodeId,
+						label: sec,
+						fileName: sec,
+						type: "secondary",
+						parentId: data.id,
+						direction: direction,
+					},
+					position: posArray[i],
+				});
+				this.cy?.add({
+					group: "edges",
+					data: {
+						id: secNodeId + "_edge",
+						source: data.id,
+						target: secNodeId,
+					},
+				});
+			});
+		} catch (error) {
+			console.error("Error processing branch node:", error);
+		}
+	}
+
+	async loadTertiaryNodes(secondaryNode: cytoscape.NodeSingular): Promise<void> {
+		if (!this.cy) return;
+
+		const data = secondaryNode.data();
+		const parentData = this.cy.getElementById(data.parentId as string).data();
+		const direction = parentData.direction as string;
+		const noteName = data.fileName as string || data.label as string;
+
+		if (!noteName || !direction) return;
+
+		const existingTertiary = this.cy.nodes(`[parentId="${data.id}"]`);
+		if (existingTertiary.length > 0) {
+			existingTertiary.style("visibility", "visible").style("opacity", 0.7);
+			return;
+		}
+
+		const file = this.app.metadataCache.getFirstLinkpathDest(noteName, "");
+		if (!file) return;
+
+		try {
+			const content = await this.app.vault.cachedRead(file);
+			const dirRegex = new RegExp(`\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``, "gm");
+			const match = dirRegex.exec(content);
+			if (!match) return;
+
+			const blockContent = match[1];
+			const linkRegex = /\[\[(.*?)\]\]/g;
+			const tertiaryLinks: string[] = [];
+
+			const centralLabel = this.cy.getElementById("central").data("label") as string;
+			const centralLC = centralLabel.toLowerCase();
+
+			let linkMatch: RegExpExecArray | null;
+			while ((linkMatch = linkRegex.exec(blockContent)) !== null) {
+				let tLink = linkMatch[1].trim();
+				if (tLink.toLowerCase().endsWith(".md")) {
+					tLink = tLink.slice(0, -3);
+				}
+
+				const tLinkLC = tLink.toLowerCase();
+				if (tLinkLC === centralLC) continue;
+
+				const alreadyInGraph = this.cy.nodes().some(n => {
+					const nodeLabel = n.data("label") as string;
+					return !!nodeLabel && nodeLabel.toLowerCase() === tLinkLC &&
+						   n.data("type") !== "tertiary";
+				});
+
+				if (!alreadyInGraph) {
+					tertiaryLinks.push(tLink);
+				}
+			}
+
+			if (!tertiaryLinks.length) return;
+
+			const addedTertiary = new Set<string>();
+
+			const secPos = secondaryNode.position();
+			const scale = 0.4;
+			const oppDir = this.getOppositeDirection(direction);
+			const posArray = this.calculateNodePositions(
+				oppDir,
+				tertiaryLinks.length,
+				secPos.x,
+				secPos.y,
+				this.cy.width() * scale,
+				this.cy.height() * scale
+			);
+
+			tertiaryLinks.forEach((tLink, i) => {
+				const tLinkLC = tLink.toLowerCase();
+				if (addedTertiary.has(tLinkLC)) return;
+				addedTertiary.add(tLinkLC);
+
+				const tId = data.id + "_tertiary_" + i;
+				this.cy?.add({
+					group: "nodes",
+					data: {
+						id: tId,
+						label: tLink,
+						fileName: tLink,
+						type: "tertiary",
+						parentId: data.id,
+					},
+					position: posArray[i],
+					style: {
+						visibility: "visible",
+						opacity: 0.7,
+					},
+				});
+				this.cy?.add({
+					group: "edges",
+					data: {
+						id: tId + "_edge",
+						source: data.id,
+						target: tId,
+					},
+					style: {
+						opacity: 0.5,
+						"line-color": "#aaaaaa",
+						width: "1px",
+					},
+				});
+			});
+		} catch (error) {
+			console.error("Error loading tertiary nodes:", error);
 		}
 	}
 }
+
 /*──────────────────────────────────────────────
-   Plugin Registration (Combined)
+   3) Settings Tab
 ──────────────────────────────────────────────*/
+class FourWindsSettingTab extends PluginSettingTab {
+	plugin: FourWindsPlugin;
 
-/**
- * CompassPlugin is your main plugin class.
- * It registers both the Compass View and the new Navigation View.
- */
-export default class CompassPlugin extends Plugin {
+	constructor(app: any, plugin: FourWindsPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
+	}
+
+	display() {
+		const { containerEl } = this;
+		containerEl.empty();
+
+		containerEl.createEl("h2", { text: "Four Winds Settings" });
+
+		/* ── Compass ── */
+		containerEl.createEl("h3", { text: "Compass" });
+
+		const dirLabels = this.plugin.settings.directionLabels || DEFAULT_SETTINGS.directionLabels;
+
+		const compassFields: Array<{ label: string; desc: string; key: keyof typeof dirLabels; defaultVal: string }> = [
+			{ label: "Parent", desc: "Admonition block name for parent links", key: "north", defaultVal: "North" },
+			{ label: "Support sibling", desc: "Admonition block name for support sibling links", key: "east", defaultVal: "East" },
+			{ label: "Children", desc: "Admonition block name for children links", key: "south", defaultVal: "South" },
+			{ label: "Conflict sibling", desc: "Admonition block name for conflict sibling links", key: "west", defaultVal: "West" },
+		];
+
+		compassFields.forEach(({ label, desc, key, defaultVal }) => {
+			new Setting(containerEl)
+				.setName(label)
+				.setDesc(desc)
+				.addText((text) =>
+					text
+						.setPlaceholder(defaultVal)
+						.setValue(dirLabels[key])
+						.onChange(async (val) => {
+							if (!this.plugin.settings.directionLabels) {
+								this.plugin.settings.directionLabels = { ...DEFAULT_SETTINGS.directionLabels };
+							}
+							this.plugin.settings.directionLabels[key] = val || defaultVal;
+							await this.plugin.saveSettings();
+						})
+				);
+		});
+
+		/* ── Seeds ── */
+		containerEl.createEl("h3", { text: "Seeds" });
+		this.renderDirectoryList(containerEl, "seedDirectories", "Seed folder");
+
+		// Seed tags
+		this.renderTagList(containerEl);
+
+		// Default sort
+		new Setting(containerEl)
+			.setName("Default sort")
+			.setDesc("How seeds are ordered when the modal opens")
+			.addDropdown((dd) => {
+				dd.addOption("shuffle", "Shuffle");
+				dd.addOption("cday", "Created (oldest first)");
+				dd.addOption("mday", "Modified (newest first)");
+				dd.addOption("tag", "By tag");
+				dd.setValue(this.plugin.settings.seedSortMode);
+				dd.onChange(async (val) => {
+					this.plugin.settings.seedSortMode = val as SeedSortMode;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		// Seed field name
+		new Setting(containerEl)
+			.setName("Seed field")
+			.setDesc("Inline field name in seed notes (e.g. seed:: my idea)")
+			.addText((text) =>
+				text
+					.setPlaceholder("seed")
+					.setValue(this.plugin.settings.seedField)
+					.onChange(async (val) => {
+						this.plugin.settings.seedField = val || "seed";
+						await this.plugin.saveSettings();
+					})
+			);
+
+		/* ── Processing ── */
+		containerEl.createEl("h3", { text: "Processing" });
+
+		this.renderTemplateList(containerEl);
+
+		/* ── Discovery ── */
+		containerEl.createEl("h3", { text: "Discovery" });
+		this.renderDirectoryList(containerEl, "discoveryDirectories", "Discovery folder");
+
+		new Setting(containerEl)
+			.setName("Auto-link")
+			.setDesc("When linking via Discovery, also add the reverse link in the discovered note")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.autoLink)
+					.onChange(async (val) => {
+						this.plugin.settings.autoLink = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		/* ── Stella ── */
+		containerEl.createEl("h3", { text: "Stella Integration" });
+
+		new Setting(containerEl)
+			.setName("Load context on process")
+			.setDesc("When processing a seed, open Stella and load the note into context")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.stellaOnProcess)
+					.onChange(async (val) => {
+						this.plugin.settings.stellaOnProcess = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		/* ── Verify ── */
+		containerEl.createEl("h3", { text: "Verify" });
+
+		const verifyContainer = containerEl.createDiv({ cls: "four-winds-verify" });
+		const verifyBtn = new Setting(verifyContainer)
+			.setName("Verify configuration")
+			.setDesc("Check that folders, template, capture format, and integrations are valid")
+			.addButton((btn) =>
+				btn.setButtonText("Verify").setCta().onClick(() => {
+					this.runVerify(verifyContainer);
+				})
+			);
+	}
+
+	private runVerify(container: HTMLElement) {
+		// Remove previous results
+		const prev = container.querySelector(".four-winds-verify-results");
+		if (prev) prev.remove();
+
+		const results = container.createDiv({ cls: "four-winds-verify-results" });
+		const s = this.plugin.settings;
+		let allGood = true;
+
+		const check = (label: string, pass: boolean, detail: string) => {
+			const row = results.createDiv({ cls: `four-winds-verify-row ${pass ? "pass" : "fail"}` });
+			row.createEl("span", { cls: "four-winds-verify-icon", text: pass ? "✓" : "✗" });
+			row.createEl("span", { cls: "four-winds-verify-label", text: label });
+			row.createEl("span", { cls: "four-winds-verify-detail", text: detail });
+			if (!pass) allGood = false;
+		};
+
+		// Check seed directories
+		for (const dir of s.seedDirectories) {
+			if (!dir) {
+				check("Seed folder", false, "Empty folder path");
+				continue;
+			}
+			const folder = this.app.vault.getAbstractFileByPath(dir);
+			check(`Seed folder: ${dir}`, folder instanceof TFolder, folder ? "Found" : "Not found");
+		}
+		if (s.seedDirectories.length === 0) {
+			check("Seed folders", false, "No seed folders configured");
+		}
+
+		// Check discovery directories
+		for (const dir of s.discoveryDirectories) {
+			if (!dir) {
+				check("Discovery folder", false, "Empty folder path");
+				continue;
+			}
+			const folder = this.app.vault.getAbstractFileByPath(dir);
+			check(`Discovery folder: ${dir}`, folder instanceof TFolder, folder ? "Found" : "Not found");
+		}
+
+		// Check templates
+		const validTemplates = s.templates.filter((t) => t.path);
+		if (validTemplates.length === 0) {
+			check("Templates", false, "No templates configured");
+		}
+		for (const tmpl of validTemplates) {
+			const tFile = this.app.vault.getAbstractFileByPath(tmpl.path);
+			check(`Template: ${tmpl.path}`, tFile instanceof TFile, tFile ? "Found" : "Not found");
+
+			if (tFile instanceof TFile) {
+				this.app.vault.cachedRead(tFile).then((content: string) => {
+					const hasPlaceholder = content.contains("{{capture}}");
+					const hasHeading = tmpl.captureHeading
+						? new RegExp(`^#{1,6}\\s+${escapeRegExpStr(tmpl.captureHeading)}`, "m").test(content)
+						: false;
+					check(`Template content: ${tmpl.path}`, hasPlaceholder || hasHeading,
+						hasPlaceholder ? "{{capture}} found" : hasHeading ? `Heading "${tmpl.captureHeading}" found` : "No {{capture}} or matching heading");
+				});
+			}
+
+			const hasVars = /\{(title|date|time|capture)\}/.test(tmpl.captureFormat);
+			check(`Capture format: ${tmpl.path}`, hasVars && tmpl.captureFormat.length > 0,
+				hasVars ? "Valid" : "No variables found");
+
+			if (tmpl.destinationFolder) {
+				const destFolder = this.app.vault.getAbstractFileByPath(tmpl.destinationFolder);
+				check(`Destination: ${tmpl.destinationFolder}`, destFolder instanceof TFolder,
+					destFolder ? "Found" : "Not found");
+			}
+		}
+
+		// Check seed field
+		check("Seed field", s.seedField.length > 0, s.seedField ? `"${s.seedField}::"` : "Empty");
+
+		// Check Stella
+		if (s.stellaOnProcess) {
+			const stella = this.app.plugins.getPlugin("Stella-dev") || this.app.plugins.getPlugin("stella");
+			check("Stella plugin", !!stella, stella ? "Installed and enabled" : "Not found — disable toggle or install Stella");
+		}
+
+		// Summary
+		const summary = results.createDiv({ cls: `four-winds-verify-summary ${allGood ? "pass" : "fail"}` });
+		summary.setText(allGood ? "All checks passed" : "Some checks failed — review above");
+	}
+
+	private getAllFolders(): string[] {
+		const folders: string[] = [];
+		const recurse = (folder: TFolder) => {
+			folders.push(folder.path);
+			for (const child of folder.children) {
+				if (child instanceof TFolder) {
+					recurse(child);
+				}
+			}
+		};
+		recurse(this.app.vault.getRoot());
+		return folders.filter((f) => f !== "/").sort();
+	}
+
+	private renderDirectoryList(
+		containerEl: HTMLElement,
+		key: "seedDirectories" | "discoveryDirectories",
+		label: string
+	) {
+		const dirs = this.plugin.settings[key];
+		const allFolders = this.getAllFolders();
+
+		for (let i = 0; i < dirs.length; i++) {
+			new Setting(containerEl)
+				.setName(`${label} ${i + 1}`)
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "— Select folder —");
+					for (const folder of allFolders) {
+						dropdown.addOption(folder, folder);
+					}
+					dropdown.setValue(dirs[i]);
+					dropdown.onChange(async (val) => {
+						dirs[i] = val;
+						await this.plugin.saveSettings();
+					});
+				})
+				.addButton((btn) =>
+					btn.setButtonText("Remove").onClick(async () => {
+						dirs.splice(i, 1);
+						await this.plugin.saveSettings();
+						this.display();
+					})
+				);
+		}
+
+		new Setting(containerEl).addButton((btn) =>
+			btn.setButtonText("Add folder").onClick(async () => {
+				dirs.push("");
+				await this.plugin.saveSettings();
+				this.display();
+			})
+		);
+	}
+
+	private renderTemplateList(containerEl: HTMLElement) {
+		const templates = this.plugin.settings.templates;
+		const allFolders = this.getAllFolders();
+
+		for (let i = 0; i < templates.length; i++) {
+			const tmpl = templates[i];
+
+			// Template group container
+			const groupEl = containerEl.createDiv({ cls: "four-winds-template-group" });
+
+			// Template path row
+			new Setting(groupEl)
+				.setName(`Template ${i + 1}`)
+				.addText((text) => {
+					text.setValue(tmpl.path).setDisabled(true);
+					text.inputEl.style.cursor = "default";
+				})
+				.addButton((btn) =>
+					btn.setButtonText("Browse").onClick(() => {
+						const allFiles = this.app.vault.getMarkdownFiles();
+						new FileSuggestModal(this.app, allFiles, async (file) => {
+							tmpl.path = file.path;
+							await this.plugin.saveSettings();
+							this.display();
+						}).open();
+					})
+				)
+				.addButton((btn) =>
+					btn.setButtonText("Remove").onClick(async () => {
+						templates.splice(i, 1);
+						await this.plugin.saveSettings();
+						this.display();
+					})
+				);
+
+			// Capture heading for this template
+			new Setting(groupEl)
+				.setName("Capture heading")
+				.setDesc("Heading where capture is inserted")
+				.addText((text) =>
+					text
+						.setPlaceholder("References")
+						.setValue(tmpl.captureHeading)
+						.onChange(async (val) => {
+							tmpl.captureHeading = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			// Capture format for this template (textarea)
+			const formatSetting = new Setting(groupEl)
+				.setName("Capture format")
+				.setDesc("Variables: {title}, {date}, {time}, {capture}");
+			const ta = new TextAreaComponent(formatSetting.controlEl);
+			ta.setPlaceholder("- [[{title}]] — {date}\n{capture}")
+				.setValue(tmpl.captureFormat);
+			ta.inputEl.rows = 4;
+			ta.inputEl.style.width = "100%";
+			ta.inputEl.style.fontFamily = "monospace";
+			ta.inputEl.style.fontSize = "13px";
+			ta.onChange(async (val) => {
+				tmpl.captureFormat = val;
+				await this.plugin.saveSettings();
+			});
+
+			// Destination folder for this template
+			new Setting(groupEl)
+				.setName("Destination folder")
+				.setDesc("Where the processed note is moved to")
+				.addDropdown((dd) => {
+					dd.addOption("", "— Same folder —");
+					for (const folder of allFolders) {
+						dd.addOption(folder, folder);
+					}
+					dd.setValue(tmpl.destinationFolder || "");
+					dd.onChange(async (val) => {
+						tmpl.destinationFolder = val;
+						await this.plugin.saveSettings();
+					});
+				});
+		}
+
+		new Setting(containerEl).addButton((btn) =>
+			btn.setButtonText("Add template").onClick(async () => {
+				const allFiles = this.app.vault.getMarkdownFiles();
+				new FileSuggestModal(this.app, allFiles, async (file) => {
+					templates.push({
+						path: file.path,
+						captureHeading: "References",
+						captureFormat: "- [[{title}]] — {date}",
+						destinationFolder: "",
+					});
+					await this.plugin.saveSettings();
+					this.display();
+				}).open();
+			})
+		);
+	}
+
+	private renderTagList(containerEl: HTMLElement) {
+		const tags = this.plugin.settings.seedTags;
+
+		for (let i = 0; i < tags.length; i++) {
+			new Setting(containerEl)
+				.setName(`Seed tag ${i + 1}`)
+				.addText((text) => {
+					text.setValue(tags[i]).setDisabled(true);
+					text.inputEl.style.cursor = "default";
+				})
+				.addButton((btn) =>
+					btn.setButtonText("Change").onClick(() => {
+						const allTags = getAllVaultTags(this.app).filter((t) => !tags.includes(t) || t === tags[i]);
+						new TagSuggestModal(this.app, allTags, async (chosen) => {
+							if (chosen) {
+								tags[i] = chosen;
+								await this.plugin.saveSettings();
+								this.display();
+							}
+						}).open();
+					})
+				)
+				.addButton((btn) =>
+					btn.setButtonText("Remove").onClick(async () => {
+						tags.splice(i, 1);
+						await this.plugin.saveSettings();
+						this.display();
+					})
+				);
+		}
+
+		new Setting(containerEl).addButton((btn) =>
+			btn.setButtonText("Add tag").onClick(() => {
+				const allTags = getAllVaultTags(this.app).filter((t) => !tags.includes(t));
+				new TagSuggestModal(this.app, allTags, async (chosen) => {
+					if (chosen && !tags.includes(chosen)) {
+						tags.push(chosen);
+						await this.plugin.saveSettings();
+						this.display();
+					}
+				}).open();
+			})
+		);
+	}
+}
+
+/*──────────────────────────────────────────────
+   4) The Plugin Class
+──────────────────────────────────────────────*/
+export default class FourWindsPlugin extends Plugin {
+	settings: FourWindsSettings;
+
 	async onload() {
-		console.log("Loading CompassPlugin...");
+		console.log("Loading Four Winds...");
 
-		// Register the Compass View (your existing view)
+		await this.loadSettings();
+
 		this.registerView(CompassView.VIEW_TYPE, (leaf) => new CompassView(leaf, this));
-
-		// Register the new Navigation View
 		this.registerView(NavigationView.VIEW_TYPE, (leaf) => new NavigationView(leaf, this));
 
-		// Add command to open the Compass View.
 		this.addCommand({
 			id: "open-compass-view",
 			name: "Open Compass View",
 			callback: () => this.activateCompassView(),
 		});
 
-		// Add command to open the Navigation View.
 		this.addCommand({
 			id: "open-navigation-view",
 			name: "Open Navigation View",
 			callback: () => this.activateNavigationView(),
 		});
 
-		// Optionally, activate one of the views on load.
+		this.addCommand({
+			id: "process-seeds",
+			name: "Process Seeds",
+			callback: () => new SeedsModal(this.app, this).open(),
+		});
+
+		this.addCommand({
+			id: "discover",
+			name: "Discover",
+			callback: () => new DiscoveryModal(this.app, this).open(),
+		});
+
+		this.addSettingTab(new FourWindsSettingTab(this.app, this));
+
 		this.activateCompassView();
 	}
 
 	onunload() {
-		console.log("Unloading CompassPlugin...");
+		console.log("Unloading Four Winds...");
 		this.app.workspace.detachLeavesOfType(CompassView.VIEW_TYPE);
 		this.app.workspace.detachLeavesOfType(NavigationView.VIEW_TYPE);
 	}
 
-	/**
-	 * Activates the Compass View in a workspace leaf.
-	 */
+	async loadSettings() {
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	}
+
+	async saveSettings() {
+		await this.saveData(this.settings);
+	}
+
 	async activateCompassView() {
-		// Try to find an existing leaf; otherwise, get one from the right sidebar.
-		let leaf = this.app.workspace.getLeavesOfType(CompassView.VIEW_TYPE)[0] ||
+		let leaf =
+			this.app.workspace.getLeavesOfType(CompassView.VIEW_TYPE)[0] ||
 			this.app.workspace.getRightLeaf(false);
 		if (!leaf) {
 			console.error("No leaf available for Compass View.");
@@ -605,12 +2632,9 @@ export default class CompassPlugin extends Plugin {
 		this.app.workspace.revealLeaf(leaf);
 	}
 
-	/**
-	 * Activates the Navigation View in its own right sidebar leaf.
-	 */
 	async activateNavigationView() {
-		// Try to find an existing leaf; otherwise, get one from the right sidebar.
-		let leaf = this.app.workspace.getLeavesOfType(NavigationView.VIEW_TYPE)[0] ||
+		let leaf =
+			this.app.workspace.getLeavesOfType(NavigationView.VIEW_TYPE)[0] ||
 			this.app.workspace.getRightLeaf(false);
 		if (!leaf) {
 			console.error("No leaf available for Navigation View.");

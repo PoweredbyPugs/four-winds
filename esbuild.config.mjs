@@ -37,7 +37,7 @@ const context = await esbuild.context({
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
-	outfile: "main.js",
+	outfile: "../../KAI/.obsidian/plugins/four-winds/main.js",
 	minify: prod,
 });
 

@@ -1,11 +1,11 @@
 {
-	"id": "Z Compass",
-	"name": "Zettelkasten Compass",
+	"id": "four-winds",
+	"name": "Four Winds",
 	"version": "1.0.0",
 	"minAppVersion": "0.15.0",
-	"description": "Navigate the cardinal directions of your Zettelkasten Compass",
-	"author": "Buckley",
-	"authorUrl": "Buckley.Design",
-	"fundingUrl": "Buckley.Design",
+	"description": "Navigate the cardinal directions of your Zettelkasten Compass, process seeds, and discover connections",
+	"author": "poweredbypugs",
+	"authorUrl": "https://github.com/poweredbypugs",
+	"fundingUrl": "https://github.com/poweredbypugs",
 	"isDesktopOnly": false
 }

@@ -1,8 +1,497 @@
 /*
+ * Styles for the Four Winds Plugin
+ */
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+/* ── Compass View ── */
+.compass-section {
+    margin-bottom: 15px;
+}
 
-If your plugin does not need CSS, delete this file.
+.compass-section h6 {
+    text-transform: capitalize;
+    margin-bottom: 5px;
+    font-weight: bold;
+    border-left: 4px solid;
+    padding-left: 8px;
+}
 
-*/
+.compass-section h6:nth-of-type(1) {
+    border-color: #607c87;
+}
+
+.compass-section h6:nth-of-type(2) {
+    border-color: #76b12b;
+}
+
+.compass-section h6:nth-of-type(3) {
+    border-color: #c7b194;
+}
+
+.compass-section h6:nth-of-type(4) {
+    border-color: #f0533f;
+}
+
+.compass-section a {
+    display: block;
+    padding: 4px 0;
+    padding-left: 12px;
+    border-radius: 4px;
+    transition: background-color 0.2s;
+}
+
+.compass-section a:hover {
+    background-color: var(--background-secondary);
+}
+
+/* ── Navigation Graph ── */
+.navigation-cy-container {
+    background-color: var(--background-primary);
+    border-radius: 4px;
+}
+
+
+/* ── Hide Modal Close Button on all Four Winds modals ── */
+.four-winds-modal .modal-close-button {
+    display: none;
+}
+
+
+/* ── Shared Modal Styles ── */
+.four-winds-counter {
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-muted);
+    padding: 8px 0;
+}
+
+.four-winds-done {
+    text-align: center;
+    font-size: 16px;
+    color: var(--text-muted);
+    padding: 40px 0;
+}
+
+.four-winds-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 0 4px;
+    flex-wrap: wrap;
+}
+
+.four-winds-btn {
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-secondary);
+    color: var(--text-normal);
+    cursor: pointer;
+    font-size: 13px;
+    transition: background-color 0.15s;
+}
+
+.four-winds-btn:hover {
+    background: var(--background-secondary-alt);
+}
+
+.four-winds-btn-trash {
+    color: #f0533f;
+}
+
+.four-winds-btn-process {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border-color: var(--interactive-accent);
+}
+
+.four-winds-btn-process:hover {
+    opacity: 0.9;
+}
+
+/* ── Seeds Card ── */
+.four-winds-seeds-modal .modal-content {
+    padding: 16px;
+}
+
+.four-winds-card {
+    position: relative;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 12px;
+    padding: 20px;
+    min-height: 250px;
+    max-height: 60vh;
+    overflow-y: auto;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+    transition: transform 0.25s ease, opacity 0.25s ease;
+    user-select: none;
+}
+
+.four-winds-card-title {
+    margin: 0 0 8px;
+    font-size: 18px;
+}
+
+.four-winds-card-preview {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-normal);
+    overflow: hidden;
+}
+
+.four-winds-card-preview p {
+    margin: 4px 0;
+}
+
+/* ── Tag Pills ── */
+.four-winds-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 10px;
+}
+
+.four-winds-tag {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    background: var(--background-secondary);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.four-winds-tag:hover {
+    background: var(--background-modifier-error);
+    color: var(--text-on-accent);
+}
+
+.four-winds-tag-add {
+    background: transparent;
+    border: 1px dashed var(--background-modifier-border);
+    color: var(--text-muted);
+    font-weight: bold;
+    min-width: 24px;
+    text-align: center;
+}
+
+.four-winds-tag-add:hover {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border-color: var(--interactive-accent);
+}
+
+.four-winds-tag-add-wrapper {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.four-winds-tag-select {
+    padding: 2px 6px;
+    border-radius: 12px;
+    border: 1px solid var(--interactive-accent);
+    font-size: 12px;
+    background: var(--background-primary);
+    color: var(--text-normal);
+    cursor: pointer;
+    outline: none;
+}
+
+.four-winds-tag-input {
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--interactive-accent);
+    font-size: 12px;
+    width: 80px;
+    background: var(--background-primary);
+    color: var(--text-normal);
+    outline: none;
+}
+
+/* ── Swipe Exit Animations ── */
+.four-winds-exit-left {
+    animation: fw-slide-left 0.25s ease forwards;
+}
+
+.four-winds-exit-right {
+    animation: fw-slide-right 0.25s ease forwards;
+}
+
+.four-winds-exit-up {
+    animation: fw-slide-up 0.3s ease forwards;
+}
+
+.four-winds-exit-down {
+    animation: fw-slide-down 0.3s ease forwards;
+}
+
+@keyframes fw-slide-left {
+    to { transform: translateX(-120%) rotate(-10deg); opacity: 0; }
+}
+
+@keyframes fw-slide-right {
+    to { transform: translateX(120%) rotate(10deg); opacity: 0; }
+}
+
+@keyframes fw-slide-up {
+    to { transform: translateY(-120%); opacity: 0; }
+}
+
+@keyframes fw-slide-down {
+    to { transform: translateY(120%); opacity: 0; }
+}
+
+/* ── Discovery Card (3D Flip) ── */
+.four-winds-discovery-modal .modal-content {
+    padding: 16px;
+}
+
+.four-winds-discovery-card {
+    position: relative;
+    perspective: 1000px;
+    min-height: 300px;
+    max-height: 450px;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+    user-select: none;
+}
+
+.four-winds-card-inner {
+    position: relative;
+    width: 100%;
+    min-height: 300px;
+    transition: transform 0.5s ease;
+    transform-style: preserve-3d;
+}
+
+.four-winds-flipped .four-winds-card-inner {
+    transform: rotateY(180deg);
+}
+
+.four-winds-card-face {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    min-height: 300px;
+    backface-visibility: hidden;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+    overflow-y: auto;
+}
+
+.four-winds-card-back {
+    transform: rotateY(180deg);
+}
+
+.four-winds-graph-container {
+    width: 100%;
+    height: 250px;
+    border-radius: 8px;
+    background: var(--background-secondary);
+}
+
+/* ── Directional Arrows ── */
+.four-winds-arrow {
+    position: absolute;
+    font-size: 14px;
+    color: var(--text-faint);
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+.four-winds-arrow-n {
+    top: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.four-winds-arrow-e {
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.four-winds-arrow-s {
+    bottom: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.four-winds-arrow-w {
+    left: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+/* ── Direction Hints ── */
+.four-winds-hints {
+    display: flex;
+    justify-content: center;
+    gap: 16px;
+    padding: 8px 0;
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+.four-winds-hint-n { color: #607c87; }
+.four-winds-hint-e { color: #76b12b; }
+.four-winds-hint-s { color: #c7b194; }
+.four-winds-hint-w { color: #f0533f; }
+
+/* ── Filter Bar ── */
+.four-winds-filter-bar {
+    display: flex;
+    gap: 8px;
+    padding: 8px 0;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.four-winds-filter-select {
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-secondary);
+    color: var(--text-normal);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+/* ── Keyboard Hints ── */
+.four-winds-kbd {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-primary);
+    font-size: 10px;
+    font-family: monospace;
+    color: var(--text-muted);
+    vertical-align: middle;
+}
+
+/* ── Seed Capture ── */
+.four-winds-seed-capture {
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    border-radius: 6px;
+    background: var(--background-secondary);
+    font-size: 13px;
+    color: var(--text-normal);
+    border-left: 3px solid var(--interactive-accent);
+}
+
+.four-winds-seed-label {
+    font-weight: bold;
+    color: var(--text-muted);
+}
+
+/* ── Template Groups ── */
+.four-winds-template-group {
+    margin-bottom: 16px;
+    padding: 12px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    background: var(--background-secondary);
+}
+
+.four-winds-template-group .setting-item {
+    border-top: none;
+    padding-top: 8px;
+    padding-bottom: 8px;
+}
+
+.four-winds-template-group .setting-item:first-child {
+    padding-top: 0;
+}
+
+/* ── Verify ── */
+.four-winds-verify-results {
+    margin-top: 12px;
+    padding: 12px;
+    border-radius: 8px;
+    background: var(--background-secondary);
+}
+
+.four-winds-verify-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13px;
+}
+
+.four-winds-verify-row.pass .four-winds-verify-icon {
+    color: #76b12b;
+}
+
+.four-winds-verify-row.fail .four-winds-verify-icon {
+    color: #f0533f;
+}
+
+.four-winds-verify-icon {
+    font-weight: bold;
+    width: 16px;
+    text-align: center;
+}
+
+.four-winds-verify-label {
+    font-weight: 500;
+}
+
+.four-winds-verify-detail {
+    color: var(--text-muted);
+    margin-left: auto;
+}
+
+.four-winds-verify-summary {
+    margin-top: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 13px;
+    text-align: center;
+}
+
+.four-winds-verify-summary.pass {
+    background: rgba(118, 177, 43, 0.15);
+    color: #76b12b;
+}
+
+.four-winds-verify-summary.fail {
+    background: rgba(240, 83, 63, 0.15);
+    color: #f0533f;
+}
+
+/* ── Mobile ── */
+@media (max-width: 768px) {
+    .four-winds-card,
+    .four-winds-card-face {
+        border-radius: 8px;
+        padding: 16px;
+    }
+
+    .four-winds-btn {
+        padding: 12px 20px;
+        font-size: 14px;
+        min-height: 44px;
+    }
+
+    .four-winds-tag {
+        padding: 4px 12px;
+        font-size: 13px;
+        min-height: 32px;
+        line-height: 24px;
+    }
+
+    .four-winds-discovery-card,
+    .four-winds-card {
+        max-height: none;
+    }
+}
