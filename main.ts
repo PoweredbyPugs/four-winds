@@ -10,6 +10,7 @@ import {
 	Setting,
 	PluginSettingTab,
 	MarkdownRenderer,
+	Menu,
 	Notice,
 	FuzzySuggestModal,
 	TextAreaComponent,
@@ -286,6 +287,41 @@ async function addLinkToBlock(
 	} finally {
 		linkMutex = false;
 	}
+}
+
+/*──────────────────────────────────────────────
+   Helper: extractCompassByRole
+──────────────────────────────────────────────*/
+// Parse a note's content and return, for each role, the set of basenames
+// currently listed in that role's compass block. Tag lookup honors the
+// user's directionNames setting. Aliased / heading / path-prefixed link
+// forms are normalized to bare basenames.
+function extractCompassByRole(
+	content: string,
+	settings: FourWindsSettings
+): Record<Role, Set<string>> {
+	const out: Record<Role, Set<string>> = {
+		parent: new Set(),
+		child: new Set(),
+		supportive_sibling: new Set(),
+		challenging_sibling: new Set(),
+	};
+	for (const role of ROLES) {
+		const tag = tagFor(settings, role);
+		const blockRe = new RegExp("```" + escapeRegExpStr(tag) + "\\n([\\s\\S]*?)```", "gm");
+		let m: RegExpExecArray | null;
+		while ((m = blockRe.exec(content)) !== null) {
+			const linkRe = /\[\[([^\]\n|#]+)(?:[#|][^\]\n]*)?\]\]/g;
+			let lm: RegExpExecArray | null;
+			while ((lm = linkRe.exec(m[1])) !== null) {
+				const name = lm[1].trim();
+				const base = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+				const trimmed = base.replace(/\.md$/i, "").trim();
+				if (trimmed) out[role].add(trimmed);
+			}
+		}
+	}
+	return out;
 }
 
 /*──────────────────────────────────────────────
@@ -1617,6 +1653,20 @@ export class NavigationView extends ItemView {
 		return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	}
 
+	// Normalize an interior wikilink target to its bare basename:
+	// strip alias (`|...`), heading (`#...`), path prefix, and `.md` suffix.
+	linkToBasename(raw: string): string {
+		let s = raw.trim();
+		const pipe = s.indexOf("|");
+		if (pipe !== -1) s = s.slice(0, pipe);
+		const hash = s.indexOf("#");
+		if (hash !== -1) s = s.slice(0, hash);
+		s = s.replace(/\.md$/i, "");
+		const slash = s.lastIndexOf("/");
+		if (slash !== -1) s = s.slice(slash + 1);
+		return s.trim();
+	}
+
 	getOppositeDirection(dir: string): string {
 		switch (dir.toLowerCase()) {
 			case "north": return "south";
@@ -1627,41 +1677,36 @@ export class NavigationView extends ItemView {
 		}
 	}
 
+	// Mutual = both notes declare the relationship. For siblings (which mirror)
+	// that's the same role on both sides; for parent/child it's the inverse.
+	// Returns true iff `otherName`'s INVERSE_ROLE[myRole] block contains a link
+	// back to `myName`. Path-prefixed and aliased / heading-suffixed links match.
 	async checkMutualConnection(
-		firstNoteName: string,
-		secondNoteName: string,
-		direction: string
+		myName: string,
+		otherName: string,
+		myRole: Role
 	): Promise<boolean> {
-		if (direction.toLowerCase() !== "east" && direction.toLowerCase() !== "west") {
-			return false;
-		}
-
 		try {
-			const firstFile = this.app.metadataCache.getFirstLinkpathDest(firstNoteName, "");
-			const secondFile = this.app.metadataCache.getFirstLinkpathDest(secondNoteName, "");
+			const otherFile = this.app.metadataCache.getFirstLinkpathDest(otherName, "");
+			if (!otherFile) return false;
 
-			if (!firstFile || !secondFile) {
-				return false;
+			const otherContent = await this.app.vault.cachedRead(otherFile);
+			const inverseRole = INVERSE_ROLE[myRole];
+			const tag = tagFor(this.plugin.settings, inverseRole);
+
+			const blockRegex = new RegExp("```" + this.escapeRegExp(tag) + "\\n([\\s\\S]*?)```", "gi");
+			const cleanMy = myName.replace(/\.md$/i, "");
+			const escapedName = this.escapeRegExp(cleanMy);
+			const linkRegex = new RegExp(
+				"\\[\\[(?:[^\\]\\n#|]*\\/)?(" + escapedName + ")(?:\\.md)?(?:[#|][^\\]\\n]*)?\\]\\]",
+				"i"
+			);
+
+			let m: RegExpExecArray | null;
+			while ((m = blockRegex.exec(otherContent)) !== null) {
+				if (linkRegex.test(m[1])) return true;
 			}
-
-			const cleanFirst = firstNoteName.toLowerCase().replace(/\.md$/i, "");
-
-			const secondContent = await this.app.vault.cachedRead(secondFile);
-
-			const sameDir = direction.toLowerCase();
-
-			const blockRegex = new RegExp(`\`\`\`ad-${sameDir}\\n([\\s\\S]*?)\`\`\``, "i");
-			const match = blockRegex.exec(secondContent);
-
-			if (!match || !match[1]) {
-				return false;
-			}
-
-			const blockContent = match[1];
-			const escapedName = this.escapeRegExp(cleanFirst);
-			const linkRegex = new RegExp(`\\[\\[(${escapedName}|${escapedName}\\.md)\\]\\]`, "i");
-
-			return linkRegex.test(blockContent);
+			return false;
 		} catch (error) {
 			console.error("Error checking mutual connection:", error);
 			return false;
@@ -1791,35 +1836,49 @@ export class NavigationView extends ItemView {
 			return;
 		}
 
-		const directions = ["north", "east", "south", "west"];
+		// Layout direction is fixed by role, regardless of what the user has
+		// renamed the role's tag to. Parent always sits north, child south,
+		// supportive sibling east, challenging sibling west.
+		const ROLE_TO_LAYOUT: Record<Role, string> = {
+			parent: "north",
+			child: "south",
+			supportive_sibling: "east",
+			challenging_sibling: "west",
+		};
 
-		const addedFiles = new Map<string, { nodeId: string; direction: string }>();
+		const settings = this.plugin.settings;
 		const centerNameLC = fileName.toLowerCase();
+		// Lowercased basename → primary branch info. Used both to dedupe a
+		// note appearing under multiple roles AND to draw cross-branch edges
+		// instead of duplicate secondary nodes when one branch references
+		// another that's already on the graph.
+		const branchByName = new Map<string, { nodeId: string; role: Role; layoutDir: string }>();
 
-		for (const dir of directions) {
-			const dirRegex = new RegExp(`\`\`\`ad-${dir}\\n([\\s\\S]*?)\`\`\``, "gm");
+		for (const role of ROLES) {
+			const tag = tagFor(settings, role);
+			const layoutDir = ROLE_TO_LAYOUT[role];
+			const dirRegex = new RegExp("```" + this.escapeRegExp(tag) + "\\n([\\s\\S]*?)```", "gm");
 			const matches = Array.from(content.matchAll(dirRegex));
 			if (!matches.length) continue;
 
-			const directionLinks: string[] = [];
+			const linkSet = new Set<string>();
 			for (const m of matches) {
 				const blockContent = m[1];
 				const linkRegex = /\[\[(.*?)\]\]/g;
-				let linkMatch;
+				let linkMatch: RegExpExecArray | null;
 				while ((linkMatch = linkRegex.exec(blockContent)) !== null) {
-					let linkName = linkMatch[1].trim().replace(/\.md$/i, "");
-
-					if (linkName.toLowerCase() === centerNameLC) continue;
-
-					directionLinks.push(linkName);
+					const basename = this.linkToBasename(linkMatch[1]);
+					if (!basename) continue;
+					if (basename.toLowerCase() === centerNameLC) continue;
+					linkSet.add(basename);
 				}
 			}
 
-			const uniqueLinks = [...new Set(directionLinks)];
-			if (!uniqueLinks.length) continue;
+			if (!linkSet.size) continue;
 
+			const uniqueLinks = Array.from(linkSet);
 			const positions = this.calculateNodePositions(
-				dir,
+				layoutDir,
 				uniqueLinks.length,
 				centerX,
 				centerY,
@@ -1830,18 +1889,19 @@ export class NavigationView extends ItemView {
 
 			uniqueLinks.forEach((link, i) => {
 				const linkLC = link.toLowerCase();
+				// Already added under another role — skip duplicate primary node
+				if (branchByName.has(linkLC)) return;
 
-				if (addedFiles.has(linkLC)) return;
-
-				const nodeId = `${dir}_${i}`;
-				addedFiles.set(linkLC, { nodeId, direction: dir });
+				const nodeId = `${role}_${i}`;
+				branchByName.set(linkLC, { nodeId, role, layoutDir });
 
 				nodes.push({
 					data: {
 						id: nodeId,
 						label: link,
 						type: "branch",
-						direction: dir,
+						direction: layoutDir,
+						role: role,
 						fileName: link,
 					},
 					position: positions[i],
@@ -1858,20 +1918,14 @@ export class NavigationView extends ItemView {
 			});
 		}
 
+		// Mutuality check for every primary branch: if the other note has me
+		// in its INVERSE_ROLE[myRole] block, the central→branch edge becomes
+		// bi-directional. Works for all four roles (parent↔child asymmetric,
+		// siblings symmetric mirror).
 		const mutualEdges = new Set<string>();
-
-		for (const [linkLC, { nodeId, direction }] of addedFiles.entries()) {
-			if (direction.toLowerCase() === "east" || direction.toLowerCase() === "west") {
-				const isMutual = await this.checkMutualConnection(
-					fileName,
-					linkLC,
-					direction
-				);
-
-				if (isMutual) {
-					mutualEdges.add(`edge_${nodeId}`);
-				}
-			}
+		for (const [linkLC, { nodeId, role }] of branchByName.entries()) {
+			const isMutual = await this.checkMutualConnection(fileName, linkLC, role);
+			if (isMutual) mutualEdges.add(`edge_${nodeId}`);
 		}
 
 		for (const edge of edges) {
@@ -1990,24 +2044,27 @@ export class NavigationView extends ItemView {
 					style: {
 						width: "0.5px",
 						"line-color": "#917959",
-						"target-arrow-shape": "none",
+						"target-arrow-shape": "triangle",
+						"target-arrow-color": "#917959",
 						"source-arrow-shape": "none",
+						"arrow-scale": 0.6,
 						"curve-style": "bezier",
 						opacity: 0.5,
 					},
 				},
 				{
-					selector: 'edge[isMutual = true]',
+					selector: 'edge[?isMutual]',
 					style: {
-						width: "0.5px",
-						"line-color": "#917959",
-						"target-arrow-shape": "triangle",
-						"target-arrow-color": "#917959",
 						"source-arrow-shape": "triangle",
 						"source-arrow-color": "#917959",
-						"arrow-scale": 0.6,
-						"curve-style": "bezier",
-						opacity: 0.6,
+						opacity: 0.7,
+					},
+				},
+				{
+					selector: 'edge[?isCross]',
+					style: {
+						"line-color": "#9c8262",
+						opacity: 0.5,
 					},
 				},
 			],
@@ -2022,6 +2079,10 @@ export class NavigationView extends ItemView {
 			this.cy.nodes().grabify();
 		}
 
+		// Suppress the browser's native context menu inside the graph so our
+		// own menu is the only one that appears on right-click.
+		cyContainer.addEventListener("contextmenu", (e) => e.preventDefault());
+
 		if (this.cy) {
 			this.cy.on("tap", "node", (evt) => {
 				const node = evt.target;
@@ -2033,6 +2094,36 @@ export class NavigationView extends ItemView {
 					const fileName = data.fileName || data.label || "";
 					this.app.workspace.openLinkText(fileName, "");
 				}
+			});
+
+			// Right-click anywhere in the graph (node or background) opens
+			// a small action menu.
+			this.cy.on("cxttap", (evt) => {
+				const original = evt.originalEvent as MouseEvent | undefined;
+				if (original) original.preventDefault?.();
+				const menu = new Menu();
+				menu.addItem((item) =>
+					item.setTitle("Refresh")
+						.setIcon("refresh-cw")
+						.onClick(() => this.render())
+				);
+				menu.addItem((item) =>
+					item.setTitle("Auto-link compass")
+						.setIcon("link")
+						.onClick(() => this.plugin.runAutoLinkCompass())
+				);
+				menu.addSeparator();
+				menu.addItem((item) =>
+					item.setTitle("Navigate back")
+						.setIcon("arrow-left")
+						.onClick(() => this.navigateInMostRecentMarkdownLeaf("back"))
+				);
+				menu.addItem((item) =>
+					item.setTitle("Navigate forward")
+						.setIcon("arrow-right")
+						.onClick(() => this.navigateInMostRecentMarkdownLeaf("forward"))
+				);
+				if (original) menu.showAtMouseEvent(original);
 			});
 
 			this.cy.on("mouseover", "node", (evt) => {
@@ -2071,69 +2162,171 @@ export class NavigationView extends ItemView {
 					}
 				});
 				this.cy.edges().style("opacity", 0.7);
-				this.cy.edges('[isMutual = true]').style("opacity", 0.8);
+				this.cy.edges('[?isMutual]').style("opacity", 0.8);
 			});
 		}
 
 		if (this.cy) {
 			const branchNodes = Array.from(this.cy.nodes('[type="branch"]'));
 			for (const branchNode of branchNodes) {
-				await this.processBranchNode(branchNode);
+				await this.processBranchNode(branchNode, branchByName);
 			}
 		}
 
 	}
 
-	async processBranchNode(branchNode: cytoscape.NodeSingular): Promise<void> {
+	// For each primary branch B, look at B's same-role admonition block and
+	// either (a) draw a cross-branch edge to an existing primary node when the
+	// link target is already on the graph, or (b) add a secondary node
+	// otherwise. Cross-edges are marked mutual when both branches reference
+	// each other along the appropriate inverse role. This is what stops the
+	// same note from showing up multiple times as a node.
+	// Right-click "Navigate back/forward" can't just fire app:go-back —
+	// when invoked from the Navigation View pane, *we* are the active leaf
+	// and have no history of our own. Find the most recently active markdown
+	// leaf, focus it, then call its history API directly.
+	private navigateInMostRecentMarkdownLeaf(direction: "back" | "forward"): void {
+		const leaves = this.app.workspace.getLeavesOfType("markdown");
+		let target: WorkspaceLeaf | null = null;
+		let bestTime = -1;
+		for (const leaf of leaves) {
+			const t = (leaf as any).activeTime || 0;
+			if (t > bestTime) {
+				bestTime = t;
+				target = leaf;
+			}
+		}
+		if (!target) {
+			new Notice("No recent note to navigate");
+			return;
+		}
+		this.app.workspace.setActiveLeaf(target, { focus: true });
+		const hist = (target as any).history;
+		if (!hist) return;
+		if (direction === "back" && typeof hist.back === "function") hist.back();
+		else if (direction === "forward" && typeof hist.forward === "function") hist.forward();
+	}
+
+	async processBranchNode(
+		branchNode: cytoscape.NodeSingular,
+		branchByName: Map<string, { nodeId: string; role: Role; layoutDir: string }>
+	): Promise<void> {
 		if (!this.cy) return;
 
 		const data = branchNode.data();
-		const direction = data.direction as string;
+		const role = data.role as Role;
+		const layoutDir = data.direction as string;
 		const branchNoteName = (data.fileName as string) ?? (data.label as string);
 
-		if (!branchNoteName || !direction) return;
+		if (!branchNoteName || !role) return;
 
 		const file = this.app.metadataCache.getFirstLinkpathDest(branchNoteName, "");
 		if (!file) return;
 
 		try {
 			const content = await this.app.vault.cachedRead(file);
-			const dirRegex = new RegExp(`\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``, "gm");
-			const match = dirRegex.exec(content);
-			if (!match) return;
+			const tag = tagFor(this.plugin.settings, role);
+			const dirRegex = new RegExp("```" + this.escapeRegExp(tag) + "\\n([\\s\\S]*?)```", "gm");
 
-			const blockContent = match[1];
-			const linkRegex = /\[\[(.*?)\]\]/g;
-			const secondaryLinks: string[] = [];
-			let linkMatch: RegExpExecArray | null;
+			// Skip the central note when found in a branch's compass — that
+			// relationship is already represented by the central→branch edge
+			// (and its mutuality flag). Adding a "secondary" pointing at the
+			// central name would just duplicate the central node visually.
+			const centralLabel = (this.cy.getElementById("central").data("label") as string) || "";
+			const centralLC = centralLabel.toLowerCase();
 
-			while ((linkMatch = linkRegex.exec(blockContent)) !== null) {
-				let secLink = linkMatch[1].trim();
-				if (secLink.toLowerCase().endsWith(".md")) {
-					secLink = secLink.slice(0, -3);
+			const collectedLinks = new Set<string>();
+			let m: RegExpExecArray | null;
+			while ((m = dirRegex.exec(content)) !== null) {
+				const linkRegex = /\[\[(.*?)\]\]/g;
+				let linkMatch: RegExpExecArray | null;
+				while ((linkMatch = linkRegex.exec(m[1])) !== null) {
+					const basename = this.linkToBasename(linkMatch[1]);
+					if (!basename) continue;
+					const lc = basename.toLowerCase();
+					if (lc === branchNoteName.toLowerCase()) continue;
+					if (lc === centralLC) continue;
+					collectedLinks.add(basename);
 				}
-				if (secLink.toLowerCase() === branchNoteName.toLowerCase()) continue;
-				secondaryLinks.push(secLink);
 			}
 
-			if (!secondaryLinks.length) return;
-			const uniqueLinks = [...new Set(secondaryLinks)];
+			if (!collectedLinks.size) return;
+
+			// Build a label→nodeId map of everything already on the graph
+			// (primaries + secondaries added by previously-processed branches)
+			// so this branch's secondaries can dedupe via cross-edges instead
+			// of creating duplicate nodes.
+			const existingByLabel = new Map<string, { nodeId: string; nodeType: string; role?: Role }>();
+			this.cy.nodes().forEach((n) => {
+				const nLabel = (n.data("label") as string) || "";
+				const nType = (n.data("type") as string) || "";
+				if (!nLabel || nType === "central" || nType === "tertiary") return;
+				existingByLabel.set(nLabel.toLowerCase(), {
+					nodeId: n.id() as string,
+					nodeType: nType,
+					role: n.data("role") as Role | undefined,
+				});
+			});
+
+			// Split: targets that already exist on the graph → cross-edges.
+			// Everything else → real new secondary nodes.
+			const trueSecondaries: string[] = [];
+			const crossTargets: Array<{ targetId: string; targetRole?: Role }> = [];
+			for (const link of collectedLinks) {
+				const existing = existingByLabel.get(link.toLowerCase());
+				if (existing && existing.nodeId !== data.id) {
+					crossTargets.push({ targetId: existing.nodeId, targetRole: existing.role });
+				} else {
+					trueSecondaries.push(link);
+				}
+			}
+
+			// Cross-branch edges. If we already have an edge in the reverse
+			// direction (the other branch was processed first and pointed at
+			// us), upgrade it to mutual. Otherwise add a fresh edge.
+			for (const { targetId, targetRole } of crossTargets) {
+				const fwdId = `cross_${data.id}__${targetId}`;
+				const revId = `cross_${targetId}__${data.id}`;
+				if (this.cy.getElementById(fwdId).length > 0) continue;
+				const reverse = this.cy.getElementById(revId);
+				if (reverse.length > 0) {
+					// Mutual when this direction is the inverse of how the
+					// other branch reached us. Roles are compatible iff
+					// INVERSE_ROLE[myRole] === targetRole (parent/child) or
+					// myRole === targetRole (sibling mirror).
+					const compatible = !!targetRole &&
+						(targetRole === INVERSE_ROLE[role] || targetRole === role);
+					if (compatible) reverse.data("isMutual", true);
+					continue;
+				}
+				this.cy.add({
+					group: "edges",
+					data: {
+						id: fwdId,
+						source: data.id,
+						target: targetId,
+						isMutual: false,
+						isCross: true,
+					},
+				});
+			}
+
+			if (!trueSecondaries.length) return;
 
 			const branchPos = branchNode.position();
 			const scale = 0.6;
 			const posArray = this.calculateNodePositions(
-				direction,
-				uniqueLinks.length,
+				layoutDir,
+				trueSecondaries.length,
 				branchPos.x,
 				branchPos.y,
 				this.cy.width() * scale,
 				this.cy.height() * scale,
-				uniqueLinks
+				trueSecondaries
 			);
 
 			const addedSecondary = new Set<string>();
-
-			uniqueLinks.forEach((sec, i) => {
+			trueSecondaries.forEach((sec, i) => {
 				const secLC = sec.toLowerCase();
 				if (addedSecondary.has(secLC)) return;
 				addedSecondary.add(secLC);
@@ -2147,7 +2340,8 @@ export class NavigationView extends ItemView {
 						fileName: sec,
 						type: "secondary",
 						parentId: data.id,
-						direction: direction,
+						direction: layoutDir,
+						role: role,
 					},
 					position: posArray[i],
 				});
@@ -2170,10 +2364,11 @@ export class NavigationView extends ItemView {
 
 		const data = secondaryNode.data();
 		const parentData = this.cy.getElementById(data.parentId as string).data();
-		const direction = parentData.direction as string;
+		const role = (parentData.role as Role) || (data.role as Role);
+		const layoutDir = parentData.direction as string;
 		const noteName = data.fileName as string || data.label as string;
 
-		if (!noteName || !direction) return;
+		if (!noteName || !role || !layoutDir) return;
 
 		const existingTertiary = this.cy.nodes(`[parentId="${data.id}"]`);
 		if (existingTertiary.length > 0) {
@@ -2186,7 +2381,8 @@ export class NavigationView extends ItemView {
 
 		try {
 			const content = await this.app.vault.cachedRead(file);
-			const dirRegex = new RegExp(`\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``, "gm");
+			const tag = tagFor(this.plugin.settings, role);
+			const dirRegex = new RegExp("```" + this.escapeRegExp(tag) + "\\n([\\s\\S]*?)```", "gm");
 			const match = dirRegex.exec(content);
 			if (!match) return;
 
@@ -2199,10 +2395,8 @@ export class NavigationView extends ItemView {
 
 			let linkMatch: RegExpExecArray | null;
 			while ((linkMatch = linkRegex.exec(blockContent)) !== null) {
-				let tLink = linkMatch[1].trim();
-				if (tLink.toLowerCase().endsWith(".md")) {
-					tLink = tLink.slice(0, -3);
-				}
+				const tLink = this.linkToBasename(linkMatch[1]);
+				if (!tLink) continue;
 
 				const tLinkLC = tLink.toLowerCase();
 				if (tLinkLC === centralLC) continue;
@@ -2224,7 +2418,7 @@ export class NavigationView extends ItemView {
 
 			const secPos = secondaryNode.position();
 			const scale = 0.4;
-			const oppDir = this.getOppositeDirection(direction);
+			const oppDir = this.getOppositeDirection(layoutDir);
 			const posArray = this.calculateNodePositions(
 				oppDir,
 				tertiaryLinks.length,
@@ -2749,7 +2943,7 @@ export default class FourWindsPlugin extends Plugin {
 
 		this.addCommand({
 			id: "auto-link-compass",
-			name: "Auto-link compass from references",
+			name: "Auto-link compass",
 			callback: () => this.runAutoLinkCompass(),
 		});
 
@@ -2817,10 +3011,15 @@ export default class FourWindsPlugin extends Plugin {
 		this.app.workspace.revealLeaf(leaf);
 	}
 
-	// Pure additive: scan the vault for notes that reference the active note
-	// inside any of the four configured compass admonition blocks, then add
-	// each such note to the active note's INVERSE_ROLE block. Existing
-	// entries are never removed or rewritten.
+	// Pure additive in both directions:
+	//   • OUTGOING — for each link in the active note's own compass blocks,
+	//     write the inverse-role link back into that other note. Reciprocates
+	//     the relationships you've already declared.
+	//   • INCOMING — for each note in the vault that references the active
+	//     note inside its compass, add that note to the active note's
+	//     inverse-role block.
+	// Existing entries are never removed or rewritten; aliased / heading /
+	// path-prefixed link forms are normalized for dedup.
 	async runAutoLinkCompass() {
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile || activeFile.extension !== "md") {
@@ -2830,73 +3029,83 @@ export default class FourWindsPlugin extends Plugin {
 
 		const settings = this.settings;
 		const targetName = activeFile.basename;
+		const targetLC = targetName.toLowerCase();
 
-		new Notice(`Scanning vault for incoming references to [[${targetName}]]…`);
+		new Notice(`Auto-linking compass for [[${targetName}]]…`);
 
+		const myContent = await this.app.vault.read(activeFile);
+		const myCompass = extractCompassByRole(myContent, settings);
+
+		// === Outgoing pass ===
+		// For each (role, otherNote) in my compass, ensure the other note
+		// has me in its INVERSE_ROLE block.
+		let outgoingAdded = 0;
+		let outgoingSkipped = 0;
+		let outgoingMissing = 0;
+
+		for (const role of ROLES) {
+			const inverseRole = INVERSE_ROLE[role];
+			const inverseTag = tagFor(settings, inverseRole);
+			for (const otherName of myCompass[role]) {
+				if (otherName.toLowerCase() === targetLC) continue;
+				const otherFile = this.app.metadataCache.getFirstLinkpathDest(otherName, "");
+				if (!otherFile) { outgoingMissing++; continue; }
+				const otherContent = await this.app.vault.cachedRead(otherFile);
+				const otherCompass = extractCompassByRole(otherContent, settings);
+				const alreadyPresent = Array.from(otherCompass[inverseRole]).some(
+					(n) => n.toLowerCase() === targetLC
+				);
+				if (alreadyPresent) { outgoingSkipped++; continue; }
+				await addLinkToBlock(this.app, otherFile.path, targetName, inverseTag);
+				outgoingAdded++;
+			}
+		}
+
+		// === Incoming pass ===
+		// Scan the vault for notes that reference the active note inside a
+		// compass block; for each, add that note to my INVERSE_ROLE block.
 		const refs = await findIncomingCompassReferences(
-			this.app,
-			settings,
-			targetName,
-			activeFile.path
+			this.app, settings, targetName, activeFile.path
 		);
 
-		if (refs.length === 0) {
-			new Notice("No incoming compass references found");
+		let incomingAdded = 0;
+		let incomingSkipped = 0;
+		// myCompass is still fresh — outgoing pass only modified other files.
+		for (const { file: otherFile, role } of refs) {
+			const myRole = INVERSE_ROLE[role];
+			const otherBase = otherFile.basename;
+			const alreadyPresent = Array.from(myCompass[myRole]).some(
+				(n) => n.toLowerCase() === otherBase.toLowerCase()
+			);
+			if (alreadyPresent) { incomingSkipped++; continue; }
+			await addLinkToBlock(this.app, activeFile.path, otherBase, tagFor(settings, myRole));
+			myCompass[myRole].add(otherBase);
+			incomingAdded++;
+		}
+
+		// === Summary notice ===
+		const totalAdded = outgoingAdded + incomingAdded;
+		const totalSkipped = outgoingSkipped + incomingSkipped;
+		const hasAnyOutgoing = Object.values(myCompass).some((s) => s.size > 0);
+
+		if (totalAdded === 0) {
+			if (refs.length === 0 && !hasAnyOutgoing) {
+				new Notice("No compass references to link");
+				return;
+			}
+			const parts: string[] = [];
+			if (totalSkipped > 0) parts.push(`${totalSkipped} already linked`);
+			if (outgoingMissing > 0) parts.push(`${outgoingMissing} target${outgoingMissing === 1 ? "" : "s"} not found`);
+			new Notice(parts.length ? `Auto-link: ${parts.join(", ")}` : "Auto-link: nothing to do");
 			return;
 		}
 
-		// Pre-read the active note's compass so we can distinguish "added"
-		// from "already present" without re-reading after every write.
-		const myContent = await this.app.vault.read(activeFile);
-		const existingByRole: Record<Role, Set<string>> = {
-			parent: new Set(),
-			child: new Set(),
-			supportive_sibling: new Set(),
-			challenging_sibling: new Set(),
-		};
-		for (const role of ROLES) {
-			const tag = tagFor(settings, role);
-			const blockRegex = new RegExp("```" + escapeRegExpStr(tag) + "\\n([\\s\\S]*?)```", "gm");
-			let m: RegExpExecArray | null;
-			while ((m = blockRegex.exec(myContent)) !== null) {
-				const linkRe = /\[\[([^\]\n|#]+)(?:[#|][^\]\n]*)?\]\]/g;
-				let lm: RegExpExecArray | null;
-				while ((lm = linkRe.exec(m[1])) !== null) {
-					// Strip path prefix to compare against basename.
-					const name = lm[1].trim();
-					const base = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
-					existingByRole[role].add(base);
-				}
-			}
-		}
-
-		let added = 0;
-		let skipped = 0;
-		for (const { file: otherFile, role } of refs) {
-			const myRole = INVERSE_ROLE[role];
-			if (existingByRole[myRole].has(otherFile.basename)) {
-				skipped++;
-				continue;
-			}
-			await addLinkToBlock(
-				this.app,
-				activeFile.path,
-				otherFile.basename,
-				tagFor(settings, myRole)
-			);
-			existingByRole[myRole].add(otherFile.basename);
-			added++;
-		}
-
-		if (added === 0) {
-			new Notice(
-				`All ${refs.length} reference${refs.length === 1 ? "" : "s"} already linked`
-			);
-		} else {
-			new Notice(
-				`Auto-link: added ${added} link${added === 1 ? "" : "s"}` +
-					(skipped ? ` (${skipped} already present)` : "")
-			);
-		}
+		const addedParts: string[] = [];
+		if (outgoingAdded > 0) addedParts.push(`${outgoingAdded} outgoing`);
+		if (incomingAdded > 0) addedParts.push(`${incomingAdded} incoming`);
+		let msg = `Auto-link: added ${addedParts.join(" + ")}`;
+		if (totalSkipped > 0) msg += ` (${totalSkipped} already present)`;
+		if (outgoingMissing > 0) msg += `; ${outgoingMissing} not found`;
+		new Notice(msg);
 	}
 }
