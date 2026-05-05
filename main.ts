@@ -34,17 +34,39 @@ declare module "obsidian" {
 ──────────────────────────────────────────────*/
 type SeedSortMode = "shuffle" | "cday" | "mday" | "tag";
 
+// Internal role ids. Stable identifiers used throughout the code; never
+// shown to the user. The user-facing name for each role lives in
+// settings.directionNames and acts as BOTH the admonition tag suffix on
+// disk (ad-{name}) and the heading shown in the UI — one source of truth.
+type Role = "parent" | "child" | "supportive_sibling" | "challenging_sibling";
+const ROLES: Role[] = ["parent", "child", "supportive_sibling", "challenging_sibling"];
+
+// Inversion semantics for auto-link + swipe-time reverse-write.
+// parent/child are asymmetric (if Other has me as parent, Other goes in my
+// child); siblings are symmetric (mutual mirror).
+const INVERSE_ROLE: Record<Role, Role> = {
+	parent: "child",
+	child: "parent",
+	supportive_sibling: "supportive_sibling",
+	challenging_sibling: "challenging_sibling",
+};
+
+// Defaults match the cardinal-direction tags users already have in their
+// vaults (`ad-north` etc.) so nothing breaks until they explicitly rename.
+const DEFAULT_DIRECTION_NAMES: Record<Role, string> = {
+	parent: "north",
+	child: "south",
+	supportive_sibling: "east",
+	challenging_sibling: "west",
+};
+
 interface FourWindsSettings {
 	seedDirectories: string[];
 	discoveryDirectories: string[];
 	autoLink: boolean;
-	// Direction labels
-	directionLabels: {
-		north: string;
-		east: string;
-		south: string;
-		west: string;
-	};
+	// Per-role admonition name. Used as the tag suffix on disk (ad-{name})
+	// AND as the heading shown in the UI.
+	directionNames: Record<Role, string>;
 	// Seeds
 	seedTags: string[];
 	seedSortMode: SeedSortMode;
@@ -64,18 +86,21 @@ const DEFAULT_SETTINGS: FourWindsSettings = {
 	seedDirectories: ["Forest"],
 	discoveryDirectories: ["Forest", "Garden"],
 	autoLink: false,
-	directionLabels: {
-		north: "North",
-		east: "East",
-		south: "South",
-		west: "West",
-	},
+	directionNames: { ...DEFAULT_DIRECTION_NAMES },
 	seedTags: [],
 	seedSortMode: "shuffle",
 	seedField: "seed",
 	templates: [],
 	stellaOnProcess: false,
 };
+
+// Resolve the full admonition block tag (e.g. "ad-north") for a role.
+// Falls back to the default if the setting is missing/empty so the plugin
+// never tries to read/write an empty block id.
+function tagFor(settings: FourWindsSettings, role: Role): string {
+	const name = (settings.directionNames && settings.directionNames[role]) || DEFAULT_DIRECTION_NAMES[role];
+	return "ad-" + name;
+}
 
 /*──────────────────────────────────────────────
    SwipeHandler — reusable pointer-event handler
@@ -218,15 +243,20 @@ function collectMarkdownFiles(folder: TFolder, out: TFile[], seen: Set<string>) 
 }
 
 /*──────────────────────────────────────────────
-   Helper: addLinkToDirection
+   Helper: addLinkToBlock
 ──────────────────────────────────────────────*/
 let linkMutex = false;
 
-async function addLinkToDirection(
+// Insert [[targetName]] into the given admonition block in filePath. If the
+// block doesn't exist it's created at the end of the file. Already-present
+// links are detected and skipped. blockTag is the full admonition id
+// (e.g. "ad-north"); resolve it via tagFor(settings, role) at the call
+// site so the role→name mapping stays in one place.
+async function addLinkToBlock(
 	app: any,
 	filePath: string,
 	targetName: string,
-	direction: string
+	blockTag: string
 ): Promise<void> {
 	// Simple mutex to prevent race conditions on rapid swipes
 	while (linkMutex) {
@@ -239,8 +269,7 @@ async function addLinkToDirection(
 
 		let content = await app.vault.read(file);
 		const link = `[[${targetName}]]`;
-		const blockTag = `ad-${direction}`;
-		const blockRegex = new RegExp("```" + blockTag + "\\n([\\s\\S]*?)```", "m");
+		const blockRegex = new RegExp("```" + escapeRegExpStr(blockTag) + "\\n([\\s\\S]*?)```", "m");
 		const match = blockRegex.exec(content);
 
 		if (match) {
@@ -257,6 +286,53 @@ async function addLinkToDirection(
 	} finally {
 		linkMutex = false;
 	}
+}
+
+/*──────────────────────────────────────────────
+   Helper: findIncomingCompassReferences
+──────────────────────────────────────────────*/
+// Scan every markdown file in the vault for any of the four configured
+// compass admonition blocks containing [[targetBasename]] (with or without
+// a path prefix, alias, or heading). Returns one (file, role) pair per
+// (file × role) that references the target. Used by Auto-link to discover
+// incoming compass references — Obsidian's metadataCache and backlink
+// index intentionally ignore links inside code blocks, so a vault scan is
+// required. Tags come from the live settings, so renaming a role's name
+// is picked up immediately on the next scan.
+async function findIncomingCompassReferences(
+	app: any,
+	settings: FourWindsSettings,
+	targetBasename: string,
+	excludePath: string
+): Promise<Array<{ file: TFile; role: Role }>> {
+	const out: Array<{ file: TFile; role: Role }> = [];
+	const linkPattern = new RegExp(
+		"\\[\\[(?:[^\\]\\n#|]*\\/)?" + escapeRegExpStr(targetBasename) + "(?:[#|][^\\]\\n]*)?\\]\\]"
+	);
+	const roleTagPairs: Array<{ role: Role; tag: string }> = ROLES.map((role) => ({
+		role,
+		tag: tagFor(settings, role),
+	}));
+
+	for (const file of app.vault.getMarkdownFiles() as TFile[]) {
+		if (file.path === excludePath) continue;
+		const content: string = await app.vault.cachedRead(file);
+		// Cheap early-out — most files won't mention the basename at all.
+		if (!content.includes(targetBasename)) continue;
+		for (const { role, tag } of roleTagPairs) {
+			const blockRegex = new RegExp("```" + escapeRegExpStr(tag) + "\\n([\\s\\S]*?)```", "gm");
+			let m: RegExpExecArray | null;
+			let foundInRole = false;
+			while ((m = blockRegex.exec(content)) !== null) {
+				if (linkPattern.test(m[1])) {
+					foundInRole = true;
+					break;
+				}
+			}
+			if (foundInRole) out.push({ file, role });
+		}
+	}
+	return out;
 }
 
 /*──────────────────────────────────────────────
@@ -454,6 +530,43 @@ class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
 }
 
 /*──────────────────────────────────────────────
+   Confirm Modal
+──────────────────────────────────────────────*/
+class ConfirmModal extends Modal {
+	private title: string;
+	private message: string;
+	private onConfirm: () => void;
+
+	constructor(app: any, title: string, message: string, onConfirm: () => void) {
+		super(app);
+		this.title = title;
+		this.message = message;
+		this.onConfirm = onConfirm;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.addClass("four-winds-confirm-modal");
+		contentEl.createEl("h3", { text: this.title });
+		contentEl.createEl("p", { text: this.message });
+
+		const btnRow = contentEl.createDiv({ cls: "four-winds-confirm-actions" });
+		const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+		cancelBtn.addEventListener("click", () => this.close());
+
+		const confirmBtn = btnRow.createEl("button", { text: "Confirm", cls: "mod-warning" });
+		confirmBtn.addEventListener("click", () => {
+			this.onConfirm();
+			this.close();
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/*──────────────────────────────────────────────
    Seeds Modal
 ──────────────────────────────────────────────*/
 class SeedsModal extends Modal {
@@ -464,6 +577,7 @@ class SeedsModal extends Modal {
 	private deletedStack: TFile[];
 	private swipeHandler: SwipeHandler | null = null;
 	private keyHandler: (e: KeyboardEvent) => void;
+	private isAnimating: boolean = false;
 
 	private activeTagFilter: string;
 	private activeSortMode: SeedSortMode;
@@ -576,12 +690,26 @@ class SeedsModal extends Modal {
 		this.swipeHandler?.destroy();
 		document.removeEventListener("keydown", this.keyHandler);
 
-		// Trash deleted files
+		// Trash deleted files with confirmation for bulk deletes
 		if (this.deletedStack.length > 0) {
 			const count = this.deletedStack.length;
-			new Notice(`Trashing ${count} seed(s)...`);
-			for (const f of this.deletedStack) {
-				this.app.vault.trash(f, false);
+			if (count > 5) {
+				new ConfirmModal(
+					this.app,
+					`Trash ${count} seeds?`,
+					`You marked ${count} seed(s) for deletion. This will move them to trash. Continue?`,
+					() => {
+						new Notice(`Trashing ${count} seed(s)...`);
+						for (const f of this.deletedStack) {
+							this.app.vault.trash(f, false);
+						}
+					}
+				).open();
+			} else {
+				new Notice(`Trashing ${count} seed(s)...`);
+				for (const f of this.deletedStack) {
+					this.app.vault.trash(f, false);
+				}
 			}
 		}
 	}
@@ -767,7 +895,8 @@ class SeedsModal extends Modal {
 	}
 
 	private swipeLeft() {
-		if (this.index >= this.cards.length) return;
+		if (this.isAnimating || this.index >= this.cards.length) return;
+		this.isAnimating = true;
 		this.cardEl.addClass("four-winds-exit-left");
 		const file = this.cards[this.index];
 		this.deletedStack.push(file);
@@ -776,18 +905,21 @@ class SeedsModal extends Modal {
 			this.cardEl.style.transform = "";
 			this.cardEl.style.opacity = "";
 			this.index++;
+			this.isAnimating = false;
 			this.renderCard();
 		}, 250);
 	}
 
 	private swipeRight() {
-		if (this.index >= this.cards.length) return;
+		if (this.isAnimating || this.index >= this.cards.length) return;
+		this.isAnimating = true;
 		this.cardEl.addClass("four-winds-exit-right");
 		setTimeout(() => {
 			this.cardEl.removeClass("four-winds-exit-right");
 			this.cardEl.style.transform = "";
 			this.cardEl.style.opacity = "";
 			this.index++;
+			this.isAnimating = false;
 			this.renderCard();
 		}, 250);
 	}
@@ -804,7 +936,7 @@ class SeedsModal extends Modal {
 	}
 
 	private async moveFile() {
-		if (this.index >= this.cards.length) return;
+		if (this.isAnimating || this.index >= this.cards.length) return;
 		const file = this.cards[this.index];
 
 		new FolderSuggestModal(this.app, async (folder: TFolder) => {
@@ -817,14 +949,14 @@ class SeedsModal extends Modal {
 	}
 
 	private async openFile() {
-		if (this.index >= this.cards.length) return;
+		if (this.isAnimating || this.index >= this.cards.length) return;
 		const file = this.cards[this.index];
 		this.close();
 		await this.app.workspace.openLinkText(file.path, "", false);
 	}
 
 	private async processSeed() {
-		if (this.index >= this.cards.length) return;
+		if (this.isAnimating || this.index >= this.cards.length) return;
 		const settings = this.plugin.settings;
 		const validTemplates = settings.templates.filter((t: any) => t.path);
 		console.log("[Four Winds] processSeed called, templates:", validTemplates.length);
@@ -1219,22 +1351,17 @@ class DiscoveryModal extends Modal {
 		});
 	}
 
-	private directionMap: Record<SwipeDirection, string> = {
-		up: "north",
-		right: "east",
-		down: "south",
-		left: "west",
-	};
-
-	private oppositeMap: Record<string, string> = {
-		north: "south",
-		south: "north",
-		east: "west",
-		west: "east",
+	// Swipe direction → role. Up/down = parent/child (asymmetric);
+	// right/left = supportive/challenging sibling (symmetric).
+	private swipeRoleMap: Record<SwipeDirection, Role> = {
+		up: "parent",
+		right: "supportive_sibling",
+		down: "child",
+		left: "challenging_sibling",
 	};
 
 	private async handleSwipe(dir: SwipeDirection, file: TFile) {
-		const compassDir = this.directionMap[dir];
+		const role = this.swipeRoleMap[dir];
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			new Notice("No active file to add link to");
@@ -1246,16 +1373,20 @@ class DiscoveryModal extends Modal {
 		const exitClass = `four-winds-exit-${dir}`;
 		this.cardEl.addClass(exitClass);
 
-		// Add link to active file's ad-{direction} block
-		await addLinkToDirection(this.app, activeFile.path, file.basename, compassDir);
+		const settings = this.plugin.settings;
+		const tag = tagFor(settings, role);
 
-		// Auto-link: add reverse link in discovered note
-		if (this.plugin.settings.autoLink) {
-			const reverseDir = this.oppositeMap[compassDir];
-			await addLinkToDirection(this.app, file.path, activeFile.basename, reverseDir);
+		// Add link to active file's compass block for this role
+		await addLinkToBlock(this.app, activeFile.path, file.basename, tag);
+
+		// Auto-link: write the inverse-role link into the discovered note
+		if (settings.autoLink) {
+			const inverseTag = tagFor(settings, INVERSE_ROLE[role]);
+			await addLinkToBlock(this.app, file.path, activeFile.basename, inverseTag);
 		}
 
-		new Notice(`Linked [[${file.basename}]] as ${compassDir}`);
+		const displayName = settings.directionNames[role] || DEFAULT_DIRECTION_NAMES[role];
+		new Notice(`Linked [[${file.basename}]] as ${displayName}`);
 
 		setTimeout(() => {
 			this.cardEl.removeClass(exitClass);
@@ -1347,41 +1478,40 @@ class CompassView extends ItemView {
 				return;
 			}
 
-			const directions = ["north", "south", "east", "west"];
+			const settings = this.plugin.settings;
+			const sections = ROLES.map((role) => ({
+				role,
+				tag: tagFor(settings, role),
+				label: settings.directionNames[role] || DEFAULT_DIRECTION_NAMES[role],
+			}));
 
-			const directionLinks: Record<string, Set<string>> = {
-				north: new Set(),
-				south: new Set(),
-				east: new Set(),
-				west: new Set(),
+			const directionLinks: Record<Role, Set<string>> = {
+				parent: new Set(),
+				child: new Set(),
+				supportive_sibling: new Set(),
+				challenging_sibling: new Set(),
 			};
 
+			// For each role, dynamic links come from other notes' INVERSE_ROLE
+			// blocks: my parent section is populated by notes that have me in
+			// their child block, etc. Siblings are mirrored, so they pull from
+			// the same role tag in the other note.
 			await Promise.all(
-				directions.map(async (dir) => {
-					if (dir === "north") {
-						const dynamicLinks = await this.fetchDynamicLinks("ad-south", activeFile.name);
-						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-					} else if (dir === "south") {
-						const dynamicLinks = await this.fetchDynamicLinks("ad-north", activeFile.name);
-						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-					} else if (dir === "east") {
-						const dynamicLinks = await this.fetchDynamicLinks("ad-east", activeFile.name);
-						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-					} else if (dir === "west") {
-						const dynamicLinks = await this.fetchDynamicLinks("ad-west", activeFile.name);
-						dynamicLinks.forEach((link) => directionLinks[dir].add(link));
-					}
+				sections.map(async ({ role }) => {
+					const otherTag = tagFor(settings, INVERSE_ROLE[role]);
+					const dynamicLinks = await this.fetchDynamicLinks(otherTag, activeFile.name);
+					dynamicLinks.forEach((link) => directionLinks[role].add(link));
 				})
 			);
 
-			directions.forEach((dir) => {
+			sections.forEach(({ role, tag, label }) => {
 				const section = container.createEl("div", { cls: "compass-section" });
-				section.createEl("h6", { text: dir.toLowerCase() });
+				section.createEl("h6", { text: label });
 
-				const hardcodedLinks = this.extractHardcodedLinks(dir, content);
-				hardcodedLinks.forEach((link) => directionLinks[dir].add(link));
+				const hardcodedLinks = this.extractHardcodedLinks(tag, content);
+				hardcodedLinks.forEach((link) => directionLinks[role].add(link));
 
-				const allLinks = Array.from(directionLinks[dir]);
+				const allLinks = Array.from(directionLinks[role]);
 				if (allLinks.length > 0) {
 					allLinks.forEach((link) => {
 						const linkEl = section.createEl("p");
@@ -1403,8 +1533,8 @@ class CompassView extends ItemView {
 		}
 	}
 
-	private extractHardcodedLinks(direction: string, content: string): string[] {
-		const regex = new RegExp(`\`\`\`ad-${direction}\\n([\\s\\S]*?)\`\`\``, "gm");
+	private extractHardcodedLinks(blockTag: string, content: string): string[] {
+		const regex = new RegExp("```" + escapeRegExpStr(blockTag) + "\\n([\\s\\S]*?)```", "gm");
 		const matches = Array.from(content.matchAll(regex));
 		const links: string[] = [];
 		for (const match of matches) {
@@ -1416,23 +1546,23 @@ class CompassView extends ItemView {
 		return links;
 	}
 
-	private async fetchDynamicLinks(admonitionType: string, currentFile: string): Promise<string[]> {
+	private async fetchDynamicLinks(blockTag: string, currentFile: string): Promise<string[]> {
 		try {
 			const dv = this.app.plugins.getPlugin("dataview");
 			if (!dv) throw new Error("Dataview plugin is not enabled or not available.");
 
 			const allNotes = dv.api.pages();
 			const result = new Set<string>();
+			const tagEsc = escapeRegExpStr(blockTag);
+			const fileEsc = escapeRegExpStr(currentFile);
 
 			for (const note of allNotes) {
 				const content = (await dv.api.io.load(note.file.path)) || "";
-
 				const regex = new RegExp(
-					`\`\`\`${admonitionType}[\\s\\S]*?\\[\\[${currentFile}\\]\\][\\s\\S]*?\`\`\``,
+					"```" + tagEsc + "[\\s\\S]*?\\[\\[" + fileEsc + "\\]\\][\\s\\S]*?```",
 					"gm"
 				);
 				const matches = content.match(regex);
-
 				if (matches) {
 					result.add(note.file.name);
 				}
@@ -2162,47 +2292,63 @@ class FourWindsSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h2", { text: "Four Winds Settings" });
 
+		/* ── README link ── */
+		const helpBox = containerEl.createDiv();
+		helpBox.style.cssText = "display: flex; align-items: center; gap: 12px; padding: 10px 14px; margin: 0 0 16px 0; background: var(--background-secondary); border-left: 3px solid var(--interactive-accent); border-radius: 4px;";
+		const helpText = helpBox.createDiv();
+		helpText.style.cssText = "flex: 1; color: var(--text-muted); font-size: 0.9em; line-height: 1.4;";
+		helpText.setText("New to Four Winds? The README walks through the compass model, fleeting-note flow, and discovery features.");
+		const helpBtn = helpBox.createEl("button", { text: "📖 Open README" });
+		helpBtn.style.cssText = "flex-shrink: 0; background: var(--interactive-accent); color: var(--text-on-accent, #fff); border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-weight: 500;";
+		helpBtn.addEventListener("click", () => {
+			window.open("https://github.com/PoweredbyPugs/four-winds/blob/main/README.md", "_blank");
+		});
+
 		/* ── Compass ── */
 		containerEl.createEl("h3", { text: "Compass" });
 
-		const dirLabels = this.plugin.settings.directionLabels || DEFAULT_SETTINGS.directionLabels;
+		const compassIntro = containerEl.createEl("p");
+		compassIntro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch; margin-top: 0;";
+		compassIntro.setText("Each role's name is used as the admonition tag suffix (ad-{name}) and as the heading shown in the compass view. Renaming a role here changes both at once.");
 
-		const compassFields: Array<{ label: string; desc: string; key: keyof typeof dirLabels; defaultVal: string }> = [
-			{ label: "Parent", desc: "Admonition block name for parent links", key: "north", defaultVal: "North" },
-			{ label: "Support sibling", desc: "Admonition block name for support sibling links", key: "east", defaultVal: "East" },
-			{ label: "Children", desc: "Admonition block name for children links", key: "south", defaultVal: "South" },
-			{ label: "Conflict sibling", desc: "Admonition block name for conflict sibling links", key: "west", defaultVal: "West" },
+		const compassFields: Array<{ label: string; desc: string; role: Role }> = [
+			{ label: "Parent", desc: "Notes that this note descends from", role: "parent" },
+			{ label: "Supportive sibling", desc: "Peers that reinforce or align with this note", role: "supportive_sibling" },
+			{ label: "Child", desc: "Notes that descend from this note", role: "child" },
+			{ label: "Challenging sibling", desc: "Peers that contrast with or challenge this note", role: "challenging_sibling" },
 		];
 
-		compassFields.forEach(({ label, desc, key, defaultVal }) => {
+		compassFields.forEach(({ label, desc, role }) => {
 			new Setting(containerEl)
 				.setName(label)
 				.setDesc(desc)
 				.addText((text) =>
 					text
-						.setPlaceholder(defaultVal)
-						.setValue(dirLabels[key])
+						.setPlaceholder(DEFAULT_DIRECTION_NAMES[role])
+						.setValue(this.plugin.settings.directionNames[role])
 						.onChange(async (val) => {
-							if (!this.plugin.settings.directionLabels) {
-								this.plugin.settings.directionLabels = { ...DEFAULT_SETTINGS.directionLabels };
-							}
-							this.plugin.settings.directionLabels[key] = val || defaultVal;
+							this.plugin.settings.directionNames[role] =
+								(val || "").trim() || DEFAULT_DIRECTION_NAMES[role];
 							await this.plugin.saveSettings();
 						})
 				);
 		});
 
-		/* ── Seeds ── */
-		containerEl.createEl("h3", { text: "Seeds" });
-		this.renderDirectoryList(containerEl, "seedDirectories", "Seed folder");
+		/* ── Fleeting notes ── */
+		containerEl.createEl("h3", { text: "Fleeting notes" });
+		const fleetingIntro = containerEl.createEl("p");
+		fleetingIntro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch; margin-top: 0;";
+		fleetingIntro.setText("Where Four Winds looks for raw, unprocessed notes that need to be developed and linked into the compass. The Process Seeds modal cycles through these.");
 
-		// Seed tags
+		this.renderDirectoryList(containerEl, "seedDirectories", "Folder");
+
+		// Tags
 		this.renderTagList(containerEl);
 
 		// Default sort
 		new Setting(containerEl)
-			.setName("Default sort")
-			.setDesc("How seeds are ordered when the modal opens")
+			.setName("Sort mode")
+			.setDesc("How fleeting notes are ordered when the Process Seeds modal opens")
 			.addDropdown((dd) => {
 				dd.addOption("shuffle", "Shuffle");
 				dd.addOption("cday", "Created (oldest first)");
@@ -2215,10 +2361,10 @@ class FourWindsSettingTab extends PluginSettingTab {
 				});
 			});
 
-		// Seed field name
+		// Metadata field name
 		new Setting(containerEl)
-			.setName("Seed field")
-			.setDesc("Inline field name in seed notes (e.g. seed:: my idea)")
+			.setName("Metadata field")
+			.setDesc("Inline field name where each fleeting note's capture text lives (e.g. seed:: my idea)")
 			.addText((text) =>
 				text
 					.setPlaceholder("seed")
@@ -2296,17 +2442,17 @@ class FourWindsSettingTab extends PluginSettingTab {
 			if (!pass) allGood = false;
 		};
 
-		// Check seed directories
+		// Check fleeting-note folders
 		for (const dir of s.seedDirectories) {
 			if (!dir) {
-				check("Seed folder", false, "Empty folder path");
+				check("Fleeting notes folder", false, "Empty folder path");
 				continue;
 			}
 			const folder = this.app.vault.getAbstractFileByPath(dir);
-			check(`Seed folder: ${dir}`, folder instanceof TFolder, folder ? "Found" : "Not found");
+			check(`Fleeting notes folder: ${dir}`, folder instanceof TFolder, folder ? "Found" : "Not found");
 		}
 		if (s.seedDirectories.length === 0) {
-			check("Seed folders", false, "No seed folders configured");
+			check("Fleeting notes folder", false, "No folders configured");
 		}
 
 		// Check discovery directories
@@ -2350,8 +2496,8 @@ class FourWindsSettingTab extends PluginSettingTab {
 			}
 		}
 
-		// Check seed field
-		check("Seed field", s.seedField.length > 0, s.seedField ? `"${s.seedField}::"` : "Empty");
+		// Check metadata field
+		check("Metadata field", s.seedField.length > 0, s.seedField ? `"${s.seedField}::"` : "Empty");
 
 		// Check Stella
 		if (s.stellaOnProcess) {
@@ -2522,7 +2668,7 @@ class FourWindsSettingTab extends PluginSettingTab {
 
 		for (let i = 0; i < tags.length; i++) {
 			new Setting(containerEl)
-				.setName(`Seed tag ${i + 1}`)
+				.setName(`Tag ${i + 1}`)
 				.addText((text) => {
 					text.setValue(tags[i]).setDisabled(true);
 					text.inputEl.style.cursor = "default";
@@ -2601,6 +2747,12 @@ export default class FourWindsPlugin extends Plugin {
 			callback: () => new DiscoveryModal(this.app, this).open(),
 		});
 
+		this.addCommand({
+			id: "auto-link-compass",
+			name: "Auto-link compass from references",
+			callback: () => this.runAutoLinkCompass(),
+		});
+
 		this.addSettingTab(new FourWindsSettingTab(this.app, this));
 
 		this.activateCompassView();
@@ -2613,7 +2765,28 @@ export default class FourWindsPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = await this.loadData();
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+
+		// Legacy migration: the old `directionLabels` (cardinal keys) was
+		// only ever used as a display label that didn't actually drive the
+		// admonition tag. The new shape stores per-role names under
+		// `directionNames`. Drop the legacy key — it'll be rewritten out of
+		// data.json on the next save.
+		if ((this.settings as any).directionLabels !== undefined) {
+			delete (this.settings as any).directionLabels;
+		}
+
+		// Defensive: ensure every role has a name, falling back to the
+		// cardinal-direction defaults (which match what's in users' notes).
+		if (!this.settings.directionNames || typeof this.settings.directionNames !== "object") {
+			this.settings.directionNames = { ...DEFAULT_DIRECTION_NAMES };
+		}
+		for (const role of ROLES) {
+			if (!this.settings.directionNames[role]) {
+				this.settings.directionNames[role] = DEFAULT_DIRECTION_NAMES[role];
+			}
+		}
 	}
 
 	async saveSettings() {
@@ -2642,5 +2815,88 @@ export default class FourWindsPlugin extends Plugin {
 		}
 		await leaf.setViewState({ type: NavigationView.VIEW_TYPE });
 		this.app.workspace.revealLeaf(leaf);
+	}
+
+	// Pure additive: scan the vault for notes that reference the active note
+	// inside any of the four configured compass admonition blocks, then add
+	// each such note to the active note's INVERSE_ROLE block. Existing
+	// entries are never removed or rewritten.
+	async runAutoLinkCompass() {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile || activeFile.extension !== "md") {
+			new Notice("Open a markdown note first");
+			return;
+		}
+
+		const settings = this.settings;
+		const targetName = activeFile.basename;
+
+		new Notice(`Scanning vault for incoming references to [[${targetName}]]…`);
+
+		const refs = await findIncomingCompassReferences(
+			this.app,
+			settings,
+			targetName,
+			activeFile.path
+		);
+
+		if (refs.length === 0) {
+			new Notice("No incoming compass references found");
+			return;
+		}
+
+		// Pre-read the active note's compass so we can distinguish "added"
+		// from "already present" without re-reading after every write.
+		const myContent = await this.app.vault.read(activeFile);
+		const existingByRole: Record<Role, Set<string>> = {
+			parent: new Set(),
+			child: new Set(),
+			supportive_sibling: new Set(),
+			challenging_sibling: new Set(),
+		};
+		for (const role of ROLES) {
+			const tag = tagFor(settings, role);
+			const blockRegex = new RegExp("```" + escapeRegExpStr(tag) + "\\n([\\s\\S]*?)```", "gm");
+			let m: RegExpExecArray | null;
+			while ((m = blockRegex.exec(myContent)) !== null) {
+				const linkRe = /\[\[([^\]\n|#]+)(?:[#|][^\]\n]*)?\]\]/g;
+				let lm: RegExpExecArray | null;
+				while ((lm = linkRe.exec(m[1])) !== null) {
+					// Strip path prefix to compare against basename.
+					const name = lm[1].trim();
+					const base = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+					existingByRole[role].add(base);
+				}
+			}
+		}
+
+		let added = 0;
+		let skipped = 0;
+		for (const { file: otherFile, role } of refs) {
+			const myRole = INVERSE_ROLE[role];
+			if (existingByRole[myRole].has(otherFile.basename)) {
+				skipped++;
+				continue;
+			}
+			await addLinkToBlock(
+				this.app,
+				activeFile.path,
+				otherFile.basename,
+				tagFor(settings, myRole)
+			);
+			existingByRole[myRole].add(otherFile.basename);
+			added++;
+		}
+
+		if (added === 0) {
+			new Notice(
+				`All ${refs.length} reference${refs.length === 1 ? "" : "s"} already linked`
+			);
+		} else {
+			new Notice(
+				`Auto-link: added ${added} link${added === 1 ? "" : "s"}` +
+					(skipped ? ` (${skipped} already present)` : "")
+			);
+		}
 	}
 }
