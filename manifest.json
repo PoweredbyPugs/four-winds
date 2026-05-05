@@ -3,7 +3,7 @@
 	"name": "Four Winds",
 	"version": "1.0.0",
 	"minAppVersion": "0.15.0",
-	"description": "Navigate the cardinal directions of your Zettelkasten Compass, process seeds, and discover connections",
+	"description": "Map your Zettelkasten as a four-way compass — parent, child, supportive sibling, challenging sibling — with auto-link and fleeting-note triage.",
 	"author": "poweredbypugs",
 	"authorUrl": "https://github.com/poweredbypugs",
 	"fundingUrl": "https://github.com/poweredbypugs",
