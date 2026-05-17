@@ -698,7 +698,9 @@ class SeedsModal extends Modal {
 
 		const skipBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-skip" });
 		skipBtn.setText("Skip");
-		skipBtn.createEl("span", { cls: "four-winds-kbd", text: "→" });
+		// Show Space as the canonical skip key — matches DiscoveryModal. The
+		// right-arrow / swipe-right gesture still works for muscle memory.
+		skipBtn.createEl("span", { cls: "four-winds-kbd", text: "␣" });
 		skipBtn.addEventListener("click", () => this.swipeRight());
 
 		const moveBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-move" });
@@ -720,6 +722,9 @@ class SeedsModal extends Modal {
 					this.swipeLeft();
 					break;
 				case "ArrowRight":
+				case " ":
+					// Space skips for parity with DiscoveryModal. Right-arrow
+					// remains bound to match the swipe-right gesture.
 					e.preventDefault();
 					this.swipeRight();
 					break;

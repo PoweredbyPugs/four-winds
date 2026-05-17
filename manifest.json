@@ -1,7 +1,7 @@
 {
 	"id": "four-winds",
 	"name": "Four Winds",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"minAppVersion": "0.15.0",
 	"description": "Map your Zettelkasten as a four-way compass — parent, child, supportive sibling, challenging sibling — with auto-link and fleeting-note triage.",
 	"author": "poweredbypugs",
