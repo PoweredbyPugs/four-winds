@@ -96,8 +96,24 @@ Aliased links (`[[Note|alias]]`), heading links (`[[Note#section]]`), and path-p
 | **Open Compass View** | Side panel with the active note's four compass sections. Each section combines two sources: literal links from the note's own admonition blocks, *and* dynamically-discovered incoming references (notes that list this one in their compass). |
 | **Open Navigation View** | Full-tab cytoscape graph of compass connections branching from the active note. |
 | **Process Seeds** | Swipe-card modal for triaging *fleeting notes* (raw, unprocessed entries). Each card represents one seed; swipe up/right/down/left to link it as parent / supportive sibling / child / challenging sibling of your active note, or skip / trash. Optionally runs a template to convert the seed into a structured note (see Processing settings). |
-| **Discover** | Swipe-card modal that surfaces notes from your discovery folders so you can connect them into the active note's compass. Same swipe controls as Process Seeds, but no template processing — pure connection-making. |
+| **Discover** | Swipe-card modal that surfaces notes from your discovery folders so you can connect them into the active note's compass. Same swipe controls as Process Seeds, but no template processing — pure connection-making. See [Discover keyboard controls](#discover-keyboard-controls). |
 | **Auto-link compass from references** | Scans every note in the vault for incoming compass references to the active note, then back-fills the inverse role into your compass. Pure additive: existing entries are never touched. Use it after a discovery session, or anytime you want to make sure your compass reflects what others have declared about it. |
+
+### Discover keyboard controls
+
+The Discover modal supports both swipe (touch / pointer drag) and keyboard input. The frame shows the four role names with their currently-bound keys; tap the **?** button in the top-right of the frame (or press `?`) to peek at the action-key legend.
+
+| Key | Action |
+|---|---|
+| ↑ / ↓ / → / ← (rebindable) | Link the current card as parent / child / supportive sibling / challenging sibling of the active note. Defaults match the swipe directions; rebind any of them under Settings → Discovery direction keys. |
+| `Space` | Skip the current card. |
+| `O` | Open the current card's note in the workspace. |
+| `D` | Mark the current card for deletion (batched; trashed on modal close, with a confirm prompt above 5). |
+| `F` | Flip the card to show a mini-graph of its existing compass connections. |
+| `Z` | Undo the last delete from this session. |
+| `?` | Toggle the action-key legend popover. |
+
+Only the four direction keys are rebindable. The action keys above are fixed.
 
 ---
 

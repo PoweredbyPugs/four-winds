@@ -61,6 +61,27 @@ const DEFAULT_DIRECTION_NAMES: Record<Role, string> = {
 	challenging_sibling: "west",
 };
 
+// Stable, user-facing role labels. Used wherever the settings UI talks
+// about the role itself (not the user-renamed compass direction). The
+// modal's edge labels still use settings.directionNames so they reflect
+// the user's compass-direction rename.
+const ROLE_LABELS: Record<Role, string> = {
+	parent: "Parent",
+	child: "Child",
+	supportive_sibling: "Supportive sibling",
+	challenging_sibling: "Challenging sibling",
+};
+
+// Default keyboard bindings for Discovery. Arrows mirror the existing
+// ▲▶▼◀ swipe semantics. User-rebindable per role in settings; stored as
+// lowercase so case-insensitive comparison works for letter keys.
+const DEFAULT_DISCOVERY_KEYS: Record<Role, string> = {
+	parent: "arrowup",
+	supportive_sibling: "arrowright",
+	child: "arrowdown",
+	challenging_sibling: "arrowleft",
+};
+
 interface FourWindsSettings {
 	seedDirectories: string[];
 	discoveryDirectories: string[];
@@ -68,6 +89,10 @@ interface FourWindsSettings {
 	// Per-role admonition name. Used as the tag suffix on disk (ad-{name})
 	// AND as the heading shown in the UI.
 	directionNames: Record<Role, string>;
+	// Per-role keyboard binding for the Discovery modal. Stored as the
+	// lowercase form of e.key (e.g. "arrowup", "w", "j"). Compared
+	// case-insensitively at handler time.
+	discoveryKeys: Record<Role, string>;
 	// Seeds
 	seedTags: string[];
 	seedSortMode: SeedSortMode;
@@ -88,6 +113,7 @@ const DEFAULT_SETTINGS: FourWindsSettings = {
 	discoveryDirectories: ["Forest", "Garden"],
 	autoLink: false,
 	directionNames: { ...DEFAULT_DIRECTION_NAMES },
+	discoveryKeys: { ...DEFAULT_DISCOVERY_KEYS },
 	seedTags: [],
 	seedSortMode: "shuffle",
 	seedField: "seed",
@@ -1156,9 +1182,20 @@ class DiscoveryModal extends Modal {
 	private swipeHandler: SwipeHandler | null = null;
 	private cy: cytoscape.Core | null = null;
 	private flipped = false;
+	// Mirrors the seed processor's guard (2026-04-16 incident): blocks
+	// pointer-spam during the swipe-exit animation so a held / repeated
+	// swipe can't mis-link the same card or skip the next one.
+	private isAnimating = false;
+	// Files queued for trashing on modal close (Seeds-style undo). Actual
+	// trashing happens in onClose with a ConfirmModal when count > 5.
+	private deletedStack: TFile[] = [];
 
 	private cardEl: HTMLElement;
 	private counterEl: HTMLElement;
+	private innerEl: HTMLElement | null = null;
+	private graphContainerEl: HTMLElement | null = null;
+	private cardContent = "";
+	private keyHandler: (e: KeyboardEvent) => void = () => {};
 
 	constructor(app: any, plugin: FourWindsPlugin) {
 		super(app);
@@ -1169,8 +1206,10 @@ class DiscoveryModal extends Modal {
 
 	async onOpen() {
 		const { contentEl } = this;
+		contentEl.empty();
 		contentEl.addClass("four-winds-discovery-modal");
 		this.modalEl.addClass("four-winds-modal");
+		this.modalEl.addClass("four-winds-discovery-shell");
 
 		const allFiles = gatherFiles(this.app, this.plugin.settings.discoveryDirectories);
 		if (allFiles.length === 0) {
@@ -1180,29 +1219,151 @@ class DiscoveryModal extends Modal {
 		this.cards = shuffle(allFiles);
 
 		this.counterEl = contentEl.createDiv({ cls: "four-winds-counter" });
-		this.cardEl = contentEl.createDiv({ cls: "four-winds-discovery-card" });
 
-		// Direction hint labels
-		const hints = contentEl.createDiv({ cls: "four-winds-hints" });
-		hints.createEl("span", { cls: "four-winds-hint-n", text: "↑ North" });
-		hints.createEl("span", { cls: "four-winds-hint-e", text: "→ East" });
-		hints.createEl("span", { cls: "four-winds-hint-s", text: "↓ South" });
-		hints.createEl("span", { cls: "four-winds-hint-w", text: "← West" });
+		// Frame: rectangular layout with role/key labels on the four edges
+		// surrounding the card. Labels read from settings.directionNames +
+		// settings.discoveryKeys so renamed roles + rebound keys both reflect.
+		const frame = contentEl.createDiv({ cls: "four-winds-frame" });
+		const settings = this.plugin.settings;
+		const keyGlyph = (k: string) => {
+			if (!k) return "?";
+			const lower = k.toLowerCase();
+			const arrows: Record<string, string> = {
+				arrowup: "↑", arrowright: "→", arrowdown: "↓", arrowleft: "←",
+			};
+			if (lower in arrows) return arrows[lower];
+			return k.length === 1 ? k.toUpperCase() : k;
+		};
+		const edgeLabel = (role: Role, edgeCls: string, arrow: string) => {
+			const raw = settings.directionNames[role] || DEFAULT_DIRECTION_NAMES[role];
+			const name = raw.charAt(0).toUpperCase() + raw.slice(1);
+			const key = settings.discoveryKeys[role] || DEFAULT_DISCOVERY_KEYS[role];
+			const wrap = frame.createDiv({ cls: `four-winds-edge ${edgeCls}` });
+			wrap.createEl("span", { cls: "four-winds-edge-arrow", text: arrow });
+			wrap.createEl("span", { cls: "four-winds-edge-name", text: name });
+			wrap.createEl("span", { cls: "four-winds-edge-key", text: keyGlyph(key) });
+		};
+		edgeLabel("parent", "four-winds-edge-n", "↑");
+		edgeLabel("supportive_sibling", "four-winds-edge-e", "→");
+		edgeLabel("child", "four-winds-edge-s", "↓");
+		edgeLabel("challenging_sibling", "four-winds-edge-w", "←");
 
-		// Skip button
-		const actions = contentEl.createDiv({ cls: "four-winds-actions" });
-		const skipBtn = actions.createEl("button", { cls: "four-winds-btn four-winds-btn-skip" });
-		skipBtn.setText("Skip →");
-		skipBtn.addEventListener("click", () => this.nextCard());
+		// Help button on the frame — toggles the action-keys legend popover.
+		// The legend covers non-configurable action keys (open / delete /
+		// flip / undo) which used to sit in an always-visible bottom bar but
+		// got clipped on shorter viewports. Click the "?" to peek at them.
+		const helpBtn = frame.createDiv({
+			cls: "four-winds-help-btn",
+			text: "?",
+			attr: { "aria-label": "Show controls", title: "Show controls (?)", role: "button", tabindex: "0" },
+		});
+
+		this.cardEl = frame.createDiv({ cls: "four-winds-discovery-card" });
+
+		// Action-keys legend — popover anchored under the help button. Hidden
+		// by default; toggled by `?` key or the help button. Lives inside the
+		// frame so it positions relative to the button.
+		const controls = frame.createDiv({ cls: "four-winds-controls-bar" });
+		const addControl = (key: string, label: string) => {
+			const item = controls.createDiv({ cls: "four-winds-control-item" });
+			item.createEl("span", { cls: "four-winds-control-key", text: key });
+			item.createEl("span", { cls: "four-winds-control-label", text: label });
+		};
+		addControl("O", "Open");
+		addControl("D", "Delete");
+		addControl("F", "Flip");
+		addControl("Z", "Undo");
+		addControl("␣", "Skip");
+
+		const toggleControls = () => {
+			const isOpen = controls.classList.toggle("is-open");
+			helpBtn.classList.toggle("is-active", isOpen);
+		};
+		helpBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			toggleControls();
+		});
+		helpBtn.addEventListener("keydown", (e) => {
+			if (e.key === "Enter" || e.key === " ") {
+				e.preventDefault();
+				toggleControls();
+			}
+		});
+
+		// Keyboard: configurable direction keys + baked-in action keys.
+		// Mirrors SeedsModal's pattern (input-field guard + e.preventDefault).
+		this.keyHandler = (e: KeyboardEvent) => {
+			if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+			const key = e.key.toLowerCase();
+			for (const role of ROLES) {
+				const bound = (this.plugin.settings.discoveryKeys[role] || DEFAULT_DISCOVERY_KEYS[role]).toLowerCase();
+				if (key === bound) {
+					e.preventDefault();
+					this.linkAsRole(role);
+					return;
+				}
+			}
+			switch (key) {
+				case "o":
+					e.preventDefault();
+					this.openCard();
+					return;
+				case "d":
+					e.preventDefault();
+					this.deleteCard();
+					return;
+				case "f":
+					e.preventDefault();
+					this.toggleFlip();
+					return;
+				case "z":
+					e.preventDefault();
+					this.undo();
+					return;
+				case " ":
+					e.preventDefault();
+					this.skipCard();
+					return;
+				case "?":
+				case "/":
+					e.preventDefault();
+					toggleControls();
+					return;
+			}
+		};
+		document.addEventListener("keydown", this.keyHandler);
 
 		await this.renderCard();
 	}
 
 	onClose() {
 		this.swipeHandler?.destroy();
+		document.removeEventListener("keydown", this.keyHandler);
 		if (this.cy) {
 			this.cy.destroy();
 			this.cy = null;
+		}
+
+		// Trash deleted files. Mirrors SeedsModal: bulk-confirm beyond 5 to
+		// avoid the held-key-spam disaster mode (2026-04-16 incident).
+		if (this.deletedStack.length > 0) {
+			const count = this.deletedStack.length;
+			const doTrash = () => {
+				new Notice(`Trashing ${count} note(s)...`);
+				for (const f of this.deletedStack) {
+					this.app.vault.trash(f, false);
+				}
+			};
+			if (count > 5) {
+				new ConfirmModal(
+					this.app,
+					`Trash ${count} notes?`,
+					`You marked ${count} note(s) for deletion during Discovery. This will move them to trash. Continue?`,
+					doTrash,
+				).open();
+			} else {
+				doTrash();
+			}
 		}
 	}
 
@@ -1211,6 +1372,8 @@ class DiscoveryModal extends Modal {
 			this.cardEl.empty();
 			this.cardEl.createEl("p", { cls: "four-winds-done", text: "No more notes to discover!" });
 			this.updateCounter();
+			this.innerEl = null;
+			this.graphContainerEl = null;
 			return;
 		}
 
@@ -1225,30 +1388,27 @@ class DiscoveryModal extends Modal {
 
 		const file = this.cards[this.index];
 		const content = await this.app.vault.cachedRead(file);
+		this.cardContent = content;
 
 		// Card inner (for 3D flip)
 		const inner = this.cardEl.createDiv({ cls: "four-winds-card-inner" });
+		this.innerEl = inner;
 
-		// Front face
+		// Front face — title + scrollable preview. Direction arrows live on
+		// the surrounding frame edges, not on the card.
 		const front = inner.createDiv({ cls: "four-winds-card-face four-winds-card-front" });
 		front.createEl("h3", { text: file.basename, cls: "four-winds-card-title" });
-
-		const previewEl = front.createDiv({ cls: "four-winds-card-preview" });
-		const previewText = content;
-		await MarkdownRenderer.renderMarkdown(previewText, previewEl, file.path, this.plugin);
-
-		// Directional arrows at edges
-		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-n", text: "▲" });
-		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-e", text: "▶" });
-		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-s", text: "▼" });
-		front.createEl("div", { cls: "four-winds-arrow four-winds-arrow-w", text: "◀" });
+		const previewScroll = front.createDiv({ cls: "four-winds-preview-scroll" });
+		await MarkdownRenderer.renderMarkdown(content, previewScroll, file.path, this.plugin);
 
 		// Back face
 		const back = inner.createDiv({ cls: "four-winds-card-face four-winds-card-back" });
 		back.createEl("h3", { text: file.basename + " — Links", cls: "four-winds-card-title" });
 		const graphContainer = back.createDiv({ cls: "four-winds-graph-container" });
+		this.graphContainerEl = graphContainer;
 
-		// Swipe handler
+		// Swipe handler (touch / pointer drag). Keyboard input goes through
+		// onOpen's document-level keydown listener.
 		this.swipeHandler = new SwipeHandler({
 			el: this.cardEl,
 			horizontalOnly: false,
@@ -1299,23 +1459,33 @@ class DiscoveryModal extends Modal {
 		];
 		const edges: cytoscape.ElementDefinition[] = [];
 
-		const directions = ["north", "east", "south", "west"];
-		const dirColors: Record<string, string> = {
-			north: "#607c87",
-			east: "#76b12b",
-			south: "#c7b194",
-			west: "#f0533f",
+		// Role-driven: pull the on-disk tag from settings (so renamed roles
+		// still parse), and key colors / offsets by role rather than the
+		// hardcoded cardinal name. parent=up, child=down, supportive=right,
+		// challenging=left — positions stay pinned to swipe directions.
+		const roleColors: Record<Role, string> = {
+			parent: "#607c87",
+			supportive_sibling: "#76b12b",
+			child: "#c7b194",
+			challenging_sibling: "#f0533f",
 		};
-		const dirOffsets: Record<string, { x: number; y: number }> = {
-			north: { x: 0, y: -80 },
-			east: { x: 100, y: 0 },
-			south: { x: 0, y: 80 },
-			west: { x: -100, y: 0 },
+		const roleOffsets: Record<Role, { x: number; y: number }> = {
+			parent: { x: 0, y: -80 },
+			supportive_sibling: { x: 100, y: 0 },
+			child: { x: 0, y: 80 },
+			challenging_sibling: { x: -100, y: 0 },
+		};
+		const isHorizontal: Record<Role, boolean> = {
+			parent: false,
+			child: false,
+			supportive_sibling: true,
+			challenging_sibling: true,
 		};
 
 		let nodeIdx = 0;
-		for (const dir of directions) {
-			const dirRegex = new RegExp("```ad-" + dir + "\\n([\\s\\S]*?)```", "gm");
+		for (const role of ROLES) {
+			const tag = tagFor(this.plugin.settings, role);
+			const dirRegex = new RegExp("```" + tag + "\\n([\\s\\S]*?)```", "gm");
 			const matches = Array.from(content.matchAll(dirRegex));
 			for (const m of matches) {
 				const linkRegex = /\[\[(.*?)\]\]/g;
@@ -1325,10 +1495,10 @@ class DiscoveryModal extends Modal {
 					const nid = `n${nodeIdx++}`;
 					const spread = (nodeIdx % 3 - 1) * 30;
 					nodes.push({
-						data: { id: nid, label: linkName, type: "branch", direction: dir },
+						data: { id: nid, label: linkName, type: "branch", role, linkName },
 						position: {
-							x: centerX + dirOffsets[dir].x + spread,
-							y: centerY + dirOffsets[dir].y + (dir === "east" || dir === "west" ? spread : 0),
+							x: centerX + roleOffsets[role].x + (isHorizontal[role] ? 0 : spread),
+							y: centerY + roleOffsets[role].y + (isHorizontal[role] ? spread : 0),
 						},
 					});
 					edges.push({
@@ -1338,7 +1508,7 @@ class DiscoveryModal extends Modal {
 			}
 		}
 
-		this.cy = cytoscapeFn({
+		const cy = cytoscapeFn({
 			container,
 			elements: [...nodes, ...edges],
 			style: [
@@ -1358,7 +1528,7 @@ class DiscoveryModal extends Modal {
 				{
 					selector: 'node[type="branch"]',
 					style: {
-						"background-color": (ele: any) => dirColors[ele.data("direction")] || "#999",
+						"background-color": (ele: any) => roleColors[ele.data("role") as Role] || "#999",
 						width: "12px",
 						height: "12px",
 						label: "data(label)",
@@ -1385,6 +1555,24 @@ class DiscoveryModal extends Modal {
 			userZoomingEnabled: false,
 			boxSelectionEnabled: false,
 		});
+		this.cy = cy;
+
+		// Branch nodes navigate to the linked note. Close the modal first so
+		// the new file lands in the active leaf instead of behind the modal.
+		cy.on("tap", 'node[type="branch"]', (evt: any) => {
+			const linkName = evt.target.data("linkName");
+			if (!linkName) return;
+			const sourcePath = file.path;
+			this.close();
+			this.app.workspace.openLinkText(linkName, sourcePath, false);
+		});
+		// Pointer cue so users discover the click affordance.
+		cy.on("mouseover", 'node[type="branch"]', () => {
+			container.style.cursor = "pointer";
+		});
+		cy.on("mouseout", 'node[type="branch"]', () => {
+			container.style.cursor = "";
+		});
 	}
 
 	// Swipe direction → role. Up/down = parent/child (asymmetric);
@@ -1396,26 +1584,44 @@ class DiscoveryModal extends Modal {
 		left: "challenging_sibling",
 	};
 
-	private async handleSwipe(dir: SwipeDirection, file: TFile) {
-		const role = this.swipeRoleMap[dir];
+	// role → SwipeDirection used to pick the exit-animation class. Keeps the
+	// visual cue consistent with how the user invoked the action (swipe or
+	// key), even when invocation source differs.
+	private exitDirForRole(role: Role): SwipeDirection {
+		switch (role) {
+			case "parent": return "up";
+			case "supportive_sibling": return "right";
+			case "child": return "down";
+			case "challenging_sibling": return "left";
+		}
+	}
+
+	private async handleSwipe(_dir: SwipeDirection, _file: TFile) {
+		await this.linkAsRole(this.swipeRoleMap[_dir]);
+	}
+
+	// Shared implementation for swipe + key paths.
+	private async linkAsRole(role: Role) {
+		if (this.isAnimating || this.index >= this.cards.length) return;
+		this.isAnimating = true;
+
+		const file = this.cards[this.index];
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			new Notice("No active file to add link to");
+			this.isAnimating = false;
 			this.nextCard();
 			return;
 		}
 
-		// Animate exit
-		const exitClass = `four-winds-exit-${dir}`;
+		const exitDir = this.exitDirForRole(role);
+		const exitClass = `four-winds-exit-${exitDir}`;
 		this.cardEl.addClass(exitClass);
 
 		const settings = this.plugin.settings;
 		const tag = tagFor(settings, role);
-
-		// Add link to active file's compass block for this role
 		await addLinkToBlock(this.app, activeFile.path, file.basename, tag);
 
-		// Auto-link: write the inverse-role link into the discovered note
 		if (settings.autoLink) {
 			const inverseTag = tagFor(settings, INVERSE_ROLE[role]);
 			await addLinkToBlock(this.app, file.path, activeFile.basename, inverseTag);
@@ -1429,15 +1635,81 @@ class DiscoveryModal extends Modal {
 			this.cardEl.style.transform = "";
 			this.cardEl.style.opacity = "";
 			this.index++;
+			this.isAnimating = false;
 			this.renderCard();
 		}, 300);
 	}
 
 	private nextCard() {
+		if (this.isAnimating || this.index >= this.cards.length) return;
 		this.index++;
 		this.cardEl.style.transform = "";
 		this.cardEl.style.opacity = "";
 		this.renderCard();
+	}
+
+	// Advance without linking or trashing. Direction-neutral fade so the
+	// motion doesn't read as a role-link or a delete.
+	private skipCard() {
+		if (this.isAnimating || this.index >= this.cards.length) return;
+		this.isAnimating = true;
+		this.cardEl.addClass("four-winds-exit-skip");
+		setTimeout(() => {
+			this.cardEl.removeClass("four-winds-exit-skip");
+			this.cardEl.style.transform = "";
+			this.cardEl.style.opacity = "";
+			this.index++;
+			this.isAnimating = false;
+			this.renderCard();
+		}, 200);
+	}
+
+	// Push current card onto deletedStack for batched trashing on close.
+	// Animates as a left exit. Z to undo before close.
+	private deleteCard() {
+		if (this.isAnimating || this.index >= this.cards.length) return;
+		this.isAnimating = true;
+
+		const file = this.cards[this.index];
+		this.deletedStack.push(file);
+		new Notice(`Marked "${file.basename}" for deletion (Z to undo)`);
+
+		this.cardEl.addClass("four-winds-exit-left");
+		setTimeout(() => {
+			this.cardEl.removeClass("four-winds-exit-left");
+			this.cardEl.style.transform = "";
+			this.cardEl.style.opacity = "";
+			this.index++;
+			this.isAnimating = false;
+			this.renderCard();
+		}, 300);
+	}
+
+	private undo() {
+		if (this.deletedStack.length === 0) {
+			new Notice("Nothing to undo");
+			return;
+		}
+		const restored = this.deletedStack.pop()!;
+		// Insert at current index so the restored card is what we land on.
+		this.cards.splice(this.index, 0, restored);
+		new Notice(`Restored "${restored.basename}"`);
+		this.renderCard();
+	}
+
+	private async openCard() {
+		if (this.isAnimating || this.index >= this.cards.length) return;
+		const file = this.cards[this.index];
+		this.close();
+		await this.app.workspace.openLinkText(file.path, "", false);
+	}
+
+	private toggleFlip() {
+		if (this.isAnimating) return;
+		if (!this.innerEl || !this.graphContainerEl) return;
+		if (this.index >= this.cards.length) return;
+		const file = this.cards[this.index];
+		this.flipCard(this.innerEl, this.graphContainerEl, file, this.cardContent);
 	}
 
 	private updateCounter() {
@@ -2590,6 +2862,47 @@ class FourWindsSettingTab extends PluginSettingTab {
 					})
 			);
 
+		// Keyboard direction bindings for the Discovery modal. O/D/F/Z stay
+		// baked in; only the four role-swipe equivalents are user-rebindable.
+		containerEl.createEl("h4", { text: "Discovery direction keys" });
+		const keyHint = containerEl.createEl("p");
+		keyHint.style.cssText = "color: var(--text-muted); font-size: 0.85em; margin: 0 0 8px;";
+		keyHint.setText("Click 'Rebind' on a row and press the key you want to use. Any single key works — arrows, letters, etc.");
+		for (const role of ROLES) {
+			const setting = new Setting(containerEl).setName(`${ROLE_LABELS[role]} key`);
+			const currentKey = () => this.plugin.settings.discoveryKeys[role] || DEFAULT_DISCOVERY_KEYS[role];
+			const formatKey = (k: string) => {
+				const map: Record<string, string> = { arrowup: "↑ Up arrow", arrowright: "→ Right arrow", arrowdown: "↓ Down arrow", arrowleft: "← Left arrow" };
+				return map[k.toLowerCase()] || k.toUpperCase();
+			};
+			setting.setDesc(`Bound to: ${formatKey(currentKey())}`);
+			setting.addButton((btn) => {
+				btn.setButtonText("Rebind").onClick(() => {
+					btn.setButtonText("Press a key…");
+					const capture = (e: KeyboardEvent) => {
+						e.preventDefault();
+						e.stopPropagation();
+						document.removeEventListener("keydown", capture, true);
+						const captured = (e.key || "").toLowerCase();
+						if (!captured) {
+							btn.setButtonText("Rebind");
+							return;
+						}
+						this.plugin.settings.discoveryKeys[role] = captured;
+						this.plugin.saveSettings().then(() => this.display());
+					};
+					document.addEventListener("keydown", capture, true);
+				});
+			});
+			setting.addExtraButton((btn) => {
+				btn.setIcon("reset").setTooltip("Reset to default").onClick(async () => {
+					this.plugin.settings.discoveryKeys[role] = DEFAULT_DISCOVERY_KEYS[role];
+					await this.plugin.saveSettings();
+					this.display();
+				});
+			});
+		}
+
 		/* ── Stella ── */
 		containerEl.createEl("h3", { text: "Stella Integration" });
 
@@ -2979,6 +3292,16 @@ export default class FourWindsPlugin extends Plugin {
 		for (const role of ROLES) {
 			if (!this.settings.directionNames[role]) {
 				this.settings.directionNames[role] = DEFAULT_DIRECTION_NAMES[role];
+			}
+		}
+
+		// Backfill Discovery keybindings for installs from before they existed.
+		if (!this.settings.discoveryKeys || typeof this.settings.discoveryKeys !== "object") {
+			this.settings.discoveryKeys = { ...DEFAULT_DISCOVERY_KEYS };
+		}
+		for (const role of ROLES) {
+			if (!this.settings.discoveryKeys[role]) {
+				this.settings.discoveryKeys[role] = DEFAULT_DISCOVERY_KEYS[role];
 			}
 		}
 	}

@@ -243,6 +243,15 @@
     to { transform: translateY(120%); opacity: 0; }
 }
 
+/* Skip — neutral fade-and-shrink so it doesn't imply a direction. */
+.four-winds-exit-skip {
+    animation: fw-fade-out 0.2s ease forwards;
+}
+
+@keyframes fw-fade-out {
+    to { transform: scale(0.92); opacity: 0; }
+}
+
 /* ── Discovery Card (3D Flip) ── */
 .four-winds-discovery-modal .modal-content {
     padding: 16px;
@@ -342,6 +351,166 @@
 .four-winds-hint-e { color: #76b12b; }
 .four-winds-hint-s { color: #c7b194; }
 .four-winds-hint-w { color: #f0533f; }
+
+/* ── Discovery Frame (vertical rectangle, edge labels) ── */
+.four-winds-discovery-shell {
+    max-width: min(780px, 96vw) !important;
+    width: 100% !important;
+}
+
+.four-winds-frame {
+    position: relative;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas:
+        ".    top    ."
+        "left card  right"
+        ".    bot   .";
+    column-gap: 12px;
+    row-gap: 8px;
+    align-items: center;
+    justify-items: center;
+    padding: 8px 0;
+}
+
+/* Help button — anchors the action-keys legend popover. Sits in the
+   top-right corner of the frame so it doesn't collide with edge labels. */
+.four-winds-help-btn {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-monospace);
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1;
+    border-radius: 50%;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+    z-index: 3;
+}
+.four-winds-help-btn:hover,
+.four-winds-help-btn.is-active {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.four-winds-edge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    white-space: nowrap;
+    user-select: none;
+}
+
+.four-winds-edge-n { grid-area: top; color: #607c87; }
+.four-winds-edge-e { grid-area: right; color: #76b12b; flex-direction: column; gap: 4px; }
+.four-winds-edge-s { grid-area: bot; color: #c7b194; }
+.four-winds-edge-w { grid-area: left; color: #f0533f; flex-direction: column; gap: 4px; }
+
+.four-winds-edge-arrow {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.four-winds-edge-name {
+    font-weight: 500;
+    letter-spacing: 0.02em;
+}
+
+.four-winds-edge-key {
+    font-family: var(--font-monospace);
+    font-size: 11px;
+    padding: 1px 6px;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    color: var(--text-muted);
+}
+
+/* Card sits in the middle of the frame grid. Height is capped; the inner
+   preview-scroll handles overflow so long notes stay scannable. */
+.four-winds-frame .four-winds-discovery-card {
+    grid-area: card;
+    width: 100%;
+    height: min(72vh, 760px);
+    min-height: 360px;
+    max-height: none;
+}
+
+.four-winds-frame .four-winds-card-inner {
+    height: 100%;
+    min-height: 0;
+}
+
+.four-winds-frame .four-winds-card-face {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.four-winds-preview-scroll {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding-right: 8px;
+    min-height: 0;
+}
+
+/* ── Action-keys legend popover (toggled by .four-winds-help-btn) ──
+   Anchored under the help button in the frame's top-right corner.
+   Hidden by default; .is-open reveals it. */
+.four-winds-controls-bar {
+    display: none;
+    position: absolute;
+    top: 32px;
+    right: 4px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    z-index: 2;
+}
+.four-winds-controls-bar.is-open {
+    display: flex;
+}
+
+.four-winds-control-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.four-winds-control-key {
+    font-family: var(--font-monospace);
+    font-size: 11px;
+    padding: 1px 6px;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    color: var(--text-normal);
+}
+
+.four-winds-control-label {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
 
 /* ── Filter Bar ── */
 .four-winds-filter-bar {
