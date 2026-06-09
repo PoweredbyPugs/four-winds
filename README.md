@@ -111,11 +111,13 @@ The Discover modal supports both swipe (touch / pointer drag) and keyboard input
 | `Space` | Skip the current card. |
 | `O` | Open the current card's note in the workspace. |
 | `D` | Mark the current card for deletion (batched; trashed on modal close, with a confirm prompt above 5). |
-| `F` | Flip the card to show a mini-graph of its existing compass connections. |
+| `F` | Flip the card to show a graph of its existing compass connections. |
 | `Z` | Undo the last delete from this session. |
 | `?` | Toggle the action-key legend popover. |
 
 Only the four direction keys are rebindable. The action keys above are fixed.
+
+**The card back** (tap or `F`) renders the note's compass as a full-card graph with the same direction colors and auto-spread labels as the Navigation View. Click a node to open that note (closes the modal; Shift+click opens it in a split to the right), or **right-click** a node for session-preserving actions: *Open in background tab* (the note opens in the workspace while the modal stays up) and *Focus note* (that note becomes the current Discovery card — your previous card resumes right after it).
 
 ---
 

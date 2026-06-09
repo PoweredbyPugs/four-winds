@@ -178,6 +178,12 @@ class SwipeHandler {
 	}
 
 	private handleDown(e: PointerEvent) {
+		// Only the primary button (or touch/pen contact) starts a swipe/tap.
+		// Right-click must pass through untouched: tracking it would (a) read
+		// the release as a tap and flip the card, and (b) setPointerCapture
+		// would steal the pointer sequence from cytoscape, so the card-back
+		// graph's context menu (cxttap) never fires.
+		if (e.button !== 0) return;
 		// Don't capture on interactive elements
 		const target = e.target as HTMLElement;
 		if (target.closest("select, input, textarea, button, .four-winds-tag, .four-winds-tag-add, .four-winds-tag-add-wrapper")) {
@@ -1178,6 +1184,238 @@ class SeedsModal extends Modal {
 }
 
 /*──────────────────────────────────────────────
+   Shared cytoscape graph helpers
+   Used by both NavigationView and the Discovery card-back mini graph so
+   the two always look and lay out the same.
+──────────────────────────────────────────────*/
+// Layout slot is fixed by role, regardless of what the user has renamed the
+// role's tag to. Parent always sits north, child south, supportive sibling
+// east, challenging sibling west.
+const ROLE_TO_LAYOUT_DIR: Record<Role, string> = {
+	parent: "north",
+	child: "south",
+	supportive_sibling: "east",
+	challenging_sibling: "west",
+};
+
+// Per-direction node colors — a hard user requirement; keep them in sync
+// with the frame edge-label colors in styles.css.
+const DIRECTION_COLORS: Record<string, string> = {
+	north: "#607c87",
+	east: "#76b12b",
+	south: "#c7b194",
+	west: "#f0533f",
+};
+
+// Labels wrap at this width (cytoscape text-max-width); position math uses
+// the same cap when estimating label boxes.
+const LABEL_MAX_WIDTH = 140;
+
+// Direction-aware initial placement. Positions are NOT clamped to the
+// container — each node gets enough room for its (wrapped) label and the
+// layout grows as needed; callers fit the camera afterwards, so a crowded
+// compass spreads out instead of overlapping.
+function calculateNodePositions(
+	direction: string,
+	nodeCount: number,
+	centerX: number,
+	centerY: number,
+	containerWidth: number,
+	containerHeight: number,
+	labels?: string[]
+): Array<{ x: number; y: number }> {
+	const positions: Array<{ x: number; y: number }> = [];
+	const dir = direction.toLowerCase();
+	const isLateral = dir === "east" || dir === "west";
+
+	// Label dimensions. Width is capped because labels wrap; rows are
+	// tall enough for a two-line wrapped label.
+	const charWidth = 7;
+	const labelWidths = labels
+		? labels.map((l) => Math.min(l.length * charWidth + 16, LABEL_MAX_WIDTH))
+		: Array(nodeCount).fill(60);
+
+	const halfW = containerWidth / 2;
+	const halfH = containerHeight / 2;
+
+	if (isLateral) {
+		// East/West: primary axis = x (pushed out into the half), nodes
+		// stacked vertically with a guaranteed per-row gap.
+		const xSign = dir === "east" ? 1 : -1;
+		const xBase = halfW * 0.45;
+		const xRange = halfW * 0.35;
+		const rowGap = 38;
+		const startY = centerY - ((nodeCount - 1) * rowGap) / 2;
+
+		for (let i = 0; i < nodeCount; i++) {
+			// Stagger x outward: alternate near/far so neighboring labels
+			// also separate horizontally.
+			const xDepth = nodeCount <= 1 ? 0.5
+				: (i % 2 === 0 ? 0.2 : 0.8);
+			positions.push({
+				x: centerX + xSign * (xBase + xDepth * xRange),
+				y: startY + i * rowGap,
+			});
+		}
+	} else {
+		// North/South: primary axis = y. Nodes alternate between a near
+		// and a far tier; each tier is packed independently by actual
+		// label width so labels in the same tier can never collide, and
+		// the tier separation keeps cross-tier labels apart.
+		const ySign = dir === "south" ? 1 : -1;
+		const yBase = halfH * 0.45;
+		const yRange = halfH * 0.35;
+		const gap = 18;
+
+		const tiers: number[][] = [[], []];
+		for (let i = 0; i < nodeCount; i++) tiers[i % 2].push(i);
+
+		const xs: number[] = new Array(nodeCount).fill(centerX);
+		for (const tier of tiers) {
+			if (!tier.length) continue;
+			const total = tier.reduce((s, idx) => s + labelWidths[idx], 0) + gap * (tier.length - 1);
+			let cur = centerX - total / 2;
+			for (const idx of tier) {
+				xs[idx] = cur + labelWidths[idx] / 2;
+				cur += labelWidths[idx] + gap;
+			}
+		}
+
+		for (let i = 0; i < nodeCount; i++) {
+			const yDepth = nodeCount <= 1 ? 0.5
+				: (i % 2 === 0 ? 0.2 : 0.8);
+			positions.push({
+				x: xs[i],
+				y: centerY + ySign * (yBase + yDepth * yRange),
+			});
+		}
+	}
+
+	return positions;
+}
+
+// Push overlapping labels apart. Per-direction placement can't see other
+// branches' clusters (or the primaries' labels), so after placement we
+// resolve collisions globally: every node's RENDERED bounding box (label
+// included, via cytoscape's boundingBox) is treated as solid, and
+// overlapping pairs are pushed apart along the axis of least penetration.
+// Nodes in `fixed` never move; when two movable nodes collide each takes
+// half the push. Iterates until stable.
+function resolveLabelOverlaps(
+	movable: cytoscape.NodeCollection,
+	fixed: cytoscape.NodeCollection
+) {
+	if (movable.length === 0) return;
+	const pad = 8;
+	const movableIds = new Set(movable.map((n) => n.id()));
+	const nodes: cytoscape.NodeSingular[] = movable.union(fixed).nodes().toArray();
+
+	for (let iter = 0; iter < 50; iter++) {
+		let moved = false;
+		for (let i = 0; i < nodes.length; i++) {
+			for (let j = i + 1; j < nodes.length; j++) {
+				const a = nodes[i];
+				const b = nodes[j];
+				const aMov = movableIds.has(a.id());
+				const bMov = movableIds.has(b.id());
+				if (!aMov && !bMov) continue;
+
+				const ba = a.boundingBox({ includeLabels: true });
+				const bb = b.boundingBox({ includeLabels: true });
+				const overlapX = Math.min(ba.x2, bb.x2) - Math.max(ba.x1, bb.x1) + pad;
+				const overlapY = Math.min(ba.y2, bb.y2) - Math.max(ba.y1, bb.y1) + pad;
+				if (overlapX <= 0 || overlapY <= 0) continue;
+				moved = true;
+
+				// Push along whichever axis needs the smaller shift.
+				const axis: "x" | "y" = overlapX < overlapY ? "x" : "y";
+				const amount = axis === "x" ? overlapX : overlapY;
+				// a goes negative-ward if it's on the negative side of b.
+				const aSign = a.position()[axis] <= b.position()[axis] ? -1 : 1;
+
+				if (aMov && bMov) {
+					a.position(axis, a.position(axis) + aSign * amount / 2);
+					b.position(axis, b.position(axis) - aSign * amount / 2);
+				} else if (aMov) {
+					a.position(axis, a.position(axis) + aSign * amount);
+				} else {
+					b.position(axis, b.position(axis) - aSign * amount);
+				}
+			}
+		}
+		if (!moved) break;
+	}
+}
+
+// Shared stylesheet for compass graphs: wrapped labels, the central node,
+// the four direction-colored branch selectors, and the base edge style.
+// Views append their own extras (secondary/tertiary/mutual/cross).
+function baseGraphStyles(opts: {
+	centralSize: number;
+	branchSize: number;
+	centralFont: number;
+	branchFont: number;
+}): any[] {
+	const dirStyle = (dir: string, valign: "top" | "bottom") => ({
+		selector: `node[type="branch"][direction="${dir}"]`,
+		style: {
+			"background-color": DIRECTION_COLORS[dir],
+			width: `${opts.branchSize}px`,
+			height: `${opts.branchSize}px`,
+			label: "data(label)",
+			"text-valign": valign,
+			"text-halign": "center",
+			"text-margin-y": valign === "top" ? -10 : 10,
+			"font-size": `${opts.branchFont}px`,
+			color: "#fff",
+		},
+	});
+	return [
+		{
+			// Base label behavior for every node: wrap long titles instead
+			// of letting them run into neighboring labels.
+			selector: "node",
+			style: {
+				"text-wrap": "wrap",
+				"text-max-width": `${LABEL_MAX_WIDTH}px`,
+			},
+		},
+		{
+			selector: 'node[type="central"]',
+			style: {
+				"background-color": "#c7b194",
+				width: `${opts.centralSize}px`,
+				height: `${opts.centralSize}px`,
+				label: "data(label)",
+				"text-valign": "bottom",
+				"text-halign": "center",
+				"text-margin-y": 10,
+				"font-size": `${opts.centralFont}px`,
+				"font-weight": "bold",
+				color: "#fff",
+			},
+		},
+		dirStyle("north", "top"),
+		dirStyle("east", "bottom"),
+		dirStyle("south", "bottom"),
+		dirStyle("west", "top"),
+		{
+			selector: "edge",
+			style: {
+				width: "0.5px",
+				"line-color": "#917959",
+				"target-arrow-shape": "triangle",
+				"target-arrow-color": "#917959",
+				"source-arrow-shape": "none",
+				"arrow-scale": 0.6,
+				"curve-style": "bezier",
+				opacity: 0.5,
+			},
+		},
+	];
+}
+
+/*──────────────────────────────────────────────
    Discovery Modal
 ──────────────────────────────────────────────*/
 class DiscoveryModal extends Modal {
@@ -1287,10 +1525,19 @@ class DiscoveryModal extends Modal {
 		helpBtn.addEventListener("click", (e) => {
 			e.stopPropagation();
 			toggleControls();
+			// The div has tabindex=0, so a mouse click leaves it focused. If
+			// focus stayed, every later Space/Enter (skip etc.) would also
+			// hit this button's keydown handler and re-toggle the legend —
+			// the "randomly blinking" bug. Keyboard users still reach it via
+			// Tab, which doesn't go through here.
+			helpBtn.blur();
 		});
 		helpBtn.addEventListener("keydown", (e) => {
 			if (e.key === "Enter" || e.key === " ") {
 				e.preventDefault();
+				// Don't let the document-level handler ALSO treat this Space
+				// as "skip card".
+				e.stopPropagation();
 				toggleControls();
 			}
 		});
@@ -1406,9 +1653,9 @@ class DiscoveryModal extends Modal {
 		const previewScroll = front.createDiv({ cls: "four-winds-preview-scroll" });
 		await MarkdownRenderer.renderMarkdown(content, previewScroll, file.path, this.plugin);
 
-		// Back face
+		// Back face — the graph fills the whole card (no heading; the central
+		// node already carries the note's name).
 		const back = inner.createDiv({ cls: "four-winds-card-face four-winds-card-back" });
-		back.createEl("h3", { text: file.basename + " — Links", cls: "four-winds-card-title" });
 		const graphContainer = back.createDiv({ cls: "four-winds-graph-container" });
 		this.graphContainerEl = graphContainer;
 
@@ -1464,112 +1711,106 @@ class DiscoveryModal extends Modal {
 		];
 		const edges: cytoscape.ElementDefinition[] = [];
 
-		// Role-driven: pull the on-disk tag from settings (so renamed roles
-		// still parse), and key colors / offsets by role rather than the
-		// hardcoded cardinal name. parent=up, child=down, supportive=right,
-		// challenging=left — positions stay pinned to swipe directions.
-		const roleColors: Record<Role, string> = {
-			parent: "#607c87",
-			supportive_sibling: "#76b12b",
-			child: "#c7b194",
-			challenging_sibling: "#f0533f",
-		};
-		const roleOffsets: Record<Role, { x: number; y: number }> = {
-			parent: { x: 0, y: -80 },
-			supportive_sibling: { x: 100, y: 0 },
-			child: { x: 0, y: 80 },
-			challenging_sibling: { x: -100, y: 0 },
-		};
-		const isHorizontal: Record<Role, boolean> = {
-			parent: false,
-			child: false,
-			supportive_sibling: true,
-			challenging_sibling: true,
-		};
+		// Same parse, placement, and direction semantics as NavigationView:
+		// extractCompassByRole honors renamed role tags and normalizes link
+		// forms; calculateNodePositions does the direction-aware, unclamped
+		// layout. A note appearing under multiple roles keeps its first slot.
+		const compass = extractCompassByRole(content, this.plugin.settings);
+		const centerLC = file.basename.toLowerCase();
+		const seen = new Set<string>();
 
 		let nodeIdx = 0;
 		for (const role of ROLES) {
-			const tag = tagFor(this.plugin.settings, role);
-			const dirRegex = new RegExp("```" + tag + "\\n([\\s\\S]*?)```", "gm");
-			const matches = Array.from(content.matchAll(dirRegex));
-			for (const m of matches) {
-				const linkRegex = /\[\[(.*?)\]\]/g;
-				let lm;
-				while ((lm = linkRegex.exec(m[1])) !== null) {
-					const linkName = lm[1].trim().replace(/\.md$/i, "");
-					const nid = `n${nodeIdx++}`;
-					const spread = (nodeIdx % 3 - 1) * 30;
-					nodes.push({
-						data: { id: nid, label: linkName, type: "branch", role, linkName },
-						position: {
-							x: centerX + roleOffsets[role].x + (isHorizontal[role] ? 0 : spread),
-							y: centerY + roleOffsets[role].y + (isHorizontal[role] ? spread : 0),
-						},
-					});
-					edges.push({
-						data: { source: "center", target: nid },
-					});
-				}
-			}
+			const layoutDir = ROLE_TO_LAYOUT_DIR[role];
+			const links = Array.from(compass[role]).filter((link) => {
+				const lc = link.toLowerCase();
+				if (lc === centerLC || seen.has(lc)) return false;
+				seen.add(lc);
+				return true;
+			});
+			if (!links.length) continue;
+
+			const positions = calculateNodePositions(
+				layoutDir, links.length, centerX, centerY, width, height, links
+			);
+			links.forEach((linkName, i) => {
+				const nid = `n${nodeIdx++}`;
+				nodes.push({
+					data: { id: nid, label: linkName, type: "branch", direction: layoutDir, role, linkName },
+					position: positions[i],
+				});
+				edges.push({
+					data: { source: "center", target: nid },
+				});
+			});
 		}
 
 		const cy = cytoscapeFn({
 			container,
 			elements: [...nodes, ...edges],
-			style: [
-				{
-					selector: 'node[type="central"]',
-					style: {
-						"background-color": "#c7b194",
-						width: "20px",
-						height: "20px",
-						label: "data(label)",
-						"font-size": "10px",
-						"text-valign": "bottom",
-						"text-margin-y": 8,
-						color: "#fff",
-					},
-				},
-				{
-					selector: 'node[type="branch"]',
-					style: {
-						"background-color": (ele: any) => roleColors[ele.data("role") as Role] || "#999",
-						width: "12px",
-						height: "12px",
-						label: "data(label)",
-						"font-size": "9px",
-						"text-valign": "bottom",
-						"text-margin-y": 6,
-						color: "#fff",
-					},
-				},
-				{
-					selector: "edge",
-					style: {
-						width: "1px",
-						"line-color": "#917959",
-						"target-arrow-shape": "triangle",
-						"target-arrow-color": "#917959",
-						"curve-style": "bezier",
-						opacity: 0.6,
-					},
-				},
-			],
+			// Smaller node/font scale than the full Navigation View — this
+			// renders inside a card back — but the same direction colors,
+			// wrapped labels, and edge treatment.
+			style: baseGraphStyles({ centralSize: 20, branchSize: 12, centralFont: 12, branchFont: 10 }),
 			layout: { name: "preset" },
+			// Panning/zooming stay off: the card's SwipeHandler owns pointer
+			// drags (a drag on the flipped card is a swipe-link). fit() below
+			// guarantees everything is visible anyway.
 			userPanningEnabled: false,
 			userZoomingEnabled: false,
 			boxSelectionEnabled: false,
 		});
 		this.cy = cy;
 
+		// Same global de-overlap pass as the Navigation View, then frame
+		// the result inside the card.
+		resolveLabelOverlaps(cy.nodes('[type="branch"]'), cy.nodes('[type="central"]'));
+		if (cy.elements().length > 1) cy.fit(undefined, 24);
+
 		// Branch nodes navigate to the linked note. Close the modal first so
-		// the new file lands in the active leaf instead of behind the modal.
+		// the new file lands where intended instead of behind the modal.
+		// Shift+tap opens in a split to the right, matching NavigationView.
+		const openLink = (linkName: string, mode?: "tab" | "split") => {
+			const sourcePath = file.path;
+			this.close();
+			this.app.workspace.openLinkText(linkName, sourcePath, mode ?? false);
+		};
+
 		cy.on("tap", 'node[type="branch"]', (evt: any) => {
 			const linkName = evt.target.data("linkName");
 			if (!linkName) return;
-			const sourcePath = file.path;
-			this.close();
-			this.app.workspace.openLinkText(linkName, sourcePath, false);
+			const original = evt.originalEvent as MouseEvent | undefined;
+			openLink(linkName, original?.shiftKey ? "split" : undefined);
+		});
+
+		// Right-click menu. Unlike NavigationView's (open in tab/split), these
+		// actions keep the Discovery session alive: background-open leaves the
+		// modal up, and Focus pulls the note in as the current card.
+		container.addEventListener("contextmenu", (e) => e.preventDefault());
+		cy.on("cxttap", 'node[type="branch"]', (evt: any) => {
+			const linkName = evt.target.data("linkName");
+			if (!linkName) return;
+			const original = evt.originalEvent as MouseEvent | undefined;
+			const target = this.app.metadataCache.getFirstLinkpathDest(linkName, file.path);
+			if (!target) {
+				new Notice(`Note not found: ${linkName}`);
+				return;
+			}
+			const menu = new Menu();
+			menu.addItem((item) =>
+				item.setTitle("Open in background tab")
+					.setIcon("file-plus")
+					.onClick(async () => {
+						await this.app.workspace.getLeaf("tab").openFile(target, { active: false });
+						new Notice(`Opened [[${target.basename}]] in background`);
+					})
+			);
+			menu.addItem((item) =>
+				item.setTitle("Focus note")
+					.setIcon("focus")
+					.onClick(() => this.focusNote(target))
+			);
+			if (original) menu.showAtMouseEvent(original);
 		});
 		// Pointer cue so users discover the click affordance.
 		cy.on("mouseover", 'node[type="branch"]', () => {
@@ -1707,6 +1948,18 @@ class DiscoveryModal extends Modal {
 		const file = this.cards[this.index];
 		this.close();
 		await this.app.workspace.openLinkText(file.path, "", false);
+	}
+
+	// Make `target` the current Discovery card (right-click → "Focus note"
+	// on the card-back graph). If it's already in the remaining deck, move
+	// it up instead of duplicating; the card we were on resumes right after.
+	// Works for notes outside the discovery folders too — focusing is an
+	// explicit ask.
+	private focusNote(target: TFile) {
+		const existing = this.cards.indexOf(target, this.index);
+		if (existing !== -1) this.cards.splice(existing, 1);
+		this.cards.splice(this.index, 0, target);
+		this.renderCard();
 	}
 
 	private toggleFlip() {
@@ -1990,144 +2243,6 @@ export class NavigationView extends ItemView {
 		}
 	}
 
-	// Positions are NOT clamped to the container — each node gets enough room
-	// for its (wrapped) label and the layout grows as needed. render() fits
-	// the camera afterwards, so a crowded compass spreads out instead of
-	// overlapping. Node labels wrap at LABEL_MAX_WIDTH (see cytoscape styles).
-	static readonly LABEL_MAX_WIDTH = 140;
-
-	calculateNodePositions(
-		direction: string,
-		nodeCount: number,
-		centerX: number,
-		centerY: number,
-		containerWidth: number,
-		containerHeight: number,
-		labels?: string[]
-	): Array<{ x: number; y: number }> {
-		const positions: Array<{ x: number; y: number }> = [];
-		const dir = direction.toLowerCase();
-		const isLateral = dir === "east" || dir === "west";
-
-		// Label dimensions. Width is capped because labels wrap; rows are
-		// tall enough for a two-line wrapped label.
-		const charWidth = 7;
-		const labelWidths = labels
-			? labels.map((l) => Math.min(l.length * charWidth + 16, NavigationView.LABEL_MAX_WIDTH))
-			: Array(nodeCount).fill(60);
-
-		const halfW = containerWidth / 2;
-		const halfH = containerHeight / 2;
-
-		if (isLateral) {
-			// East/West: primary axis = x (pushed out into the half), nodes
-			// stacked vertically with a guaranteed per-row gap.
-			const xSign = dir === "east" ? 1 : -1;
-			const xBase = halfW * 0.45;
-			const xRange = halfW * 0.35;
-			const rowGap = 38;
-			const startY = centerY - ((nodeCount - 1) * rowGap) / 2;
-
-			for (let i = 0; i < nodeCount; i++) {
-				// Stagger x outward: alternate near/far so neighboring labels
-				// also separate horizontally.
-				const xDepth = nodeCount <= 1 ? 0.5
-					: (i % 2 === 0 ? 0.2 : 0.8);
-				positions.push({
-					x: centerX + xSign * (xBase + xDepth * xRange),
-					y: startY + i * rowGap,
-				});
-			}
-		} else {
-			// North/South: primary axis = y. Nodes alternate between a near
-			// and a far tier; each tier is packed independently by actual
-			// label width so labels in the same tier can never collide, and
-			// the tier separation keeps cross-tier labels apart.
-			const ySign = dir === "south" ? 1 : -1;
-			const yBase = halfH * 0.45;
-			const yRange = halfH * 0.35;
-			const gap = 18;
-
-			const tiers: number[][] = [[], []];
-			for (let i = 0; i < nodeCount; i++) tiers[i % 2].push(i);
-
-			const xs: number[] = new Array(nodeCount).fill(centerX);
-			for (const tier of tiers) {
-				if (!tier.length) continue;
-				const total = tier.reduce((s, idx) => s + labelWidths[idx], 0) + gap * (tier.length - 1);
-				let cur = centerX - total / 2;
-				for (const idx of tier) {
-					xs[idx] = cur + labelWidths[idx] / 2;
-					cur += labelWidths[idx] + gap;
-				}
-			}
-
-			for (let i = 0; i < nodeCount; i++) {
-				const yDepth = nodeCount <= 1 ? 0.5
-					: (i % 2 === 0 ? 0.2 : 0.8);
-				positions.push({
-					x: xs[i],
-					y: centerY + ySign * (yBase + yDepth * yRange),
-				});
-			}
-		}
-
-		return positions;
-	}
-
-	// Push overlapping labels apart. Per-direction placement can't see other
-	// branches' secondary clusters (or the primaries' labels), so after
-	// placement we resolve collisions globally: every node's RENDERED bounding
-	// box (label included, via cytoscape's boundingBox) is treated as solid,
-	// and overlapping pairs are pushed apart along the axis of least
-	// penetration. Nodes in `fixed` never move; when two movable nodes
-	// collide each takes half the push. Iterates until stable.
-	private resolveLabelOverlaps(
-		movable: cytoscape.NodeCollection,
-		fixed: cytoscape.NodeCollection
-	) {
-		if (!this.cy || movable.length === 0) return;
-		const pad = 8;
-		const movableIds = new Set(movable.map((n) => n.id()));
-		const nodes: cytoscape.NodeSingular[] = movable.union(fixed).nodes().toArray();
-
-		for (let iter = 0; iter < 50; iter++) {
-			let moved = false;
-			for (let i = 0; i < nodes.length; i++) {
-				for (let j = i + 1; j < nodes.length; j++) {
-					const a = nodes[i];
-					const b = nodes[j];
-					const aMov = movableIds.has(a.id());
-					const bMov = movableIds.has(b.id());
-					if (!aMov && !bMov) continue;
-
-					const ba = a.boundingBox({ includeLabels: true });
-					const bb = b.boundingBox({ includeLabels: true });
-					const overlapX = Math.min(ba.x2, bb.x2) - Math.max(ba.x1, bb.x1) + pad;
-					const overlapY = Math.min(ba.y2, bb.y2) - Math.max(ba.y1, bb.y1) + pad;
-					if (overlapX <= 0 || overlapY <= 0) continue;
-					moved = true;
-
-					// Push along whichever axis needs the smaller shift.
-					const axis: "x" | "y" = overlapX < overlapY ? "x" : "y";
-					const amount = axis === "x" ? overlapX : overlapY;
-					// a goes negative-ward if it's on the negative side of b.
-					const aSign = a.position()[axis] <= b.position()[axis] ? -1 : 1;
-
-					if (aMov && bMov) {
-						a.position(axis, a.position(axis) + aSign * amount / 2);
-						b.position(axis, b.position(axis) - aSign * amount / 2);
-					} else if (aMov) {
-						a.position(axis, a.position(axis) + aSign * amount);
-					} else {
-						b.position(axis, b.position(axis) - aSign * amount);
-					}
-				}
-			}
-			if (!moved) break;
-		}
-	}
-
 	async render() {
 		const container = this.contentEl;
 		container.empty();
@@ -2167,16 +2282,6 @@ export class NavigationView extends ItemView {
 			return;
 		}
 
-		// Layout direction is fixed by role, regardless of what the user has
-		// renamed the role's tag to. Parent always sits north, child south,
-		// supportive sibling east, challenging sibling west.
-		const ROLE_TO_LAYOUT: Record<Role, string> = {
-			parent: "north",
-			child: "south",
-			supportive_sibling: "east",
-			challenging_sibling: "west",
-		};
-
 		const settings = this.plugin.settings;
 		const centerNameLC = fileName.toLowerCase();
 		// Lowercased basename → primary branch info. Used both to dedupe a
@@ -2187,7 +2292,7 @@ export class NavigationView extends ItemView {
 
 		for (const role of ROLES) {
 			const tag = tagFor(settings, role);
-			const layoutDir = ROLE_TO_LAYOUT[role];
+			const layoutDir = ROLE_TO_LAYOUT_DIR[role];
 			const dirRegex = new RegExp("```" + this.escapeRegExp(tag) + "\\n([\\s\\S]*?)```", "gm");
 			const matches = Array.from(content.matchAll(dirRegex));
 			if (!matches.length) continue;
@@ -2208,7 +2313,7 @@ export class NavigationView extends ItemView {
 			if (!linkSet.size) continue;
 
 			const uniqueLinks = Array.from(linkSet);
-			const positions = this.calculateNodePositions(
+			const positions = calculateNodePositions(
 				layoutDir,
 				uniqueLinks.length,
 				centerX,
@@ -2268,86 +2373,10 @@ export class NavigationView extends ItemView {
 			container: cyContainer,
 			elements: [...nodes, ...edges],
 			style: [
-				{
-					// Base label behavior for every node: wrap long titles
-					// instead of letting them run into neighboring labels.
-					selector: "node",
-					style: {
-						"text-wrap": "wrap",
-						"text-max-width": `${NavigationView.LABEL_MAX_WIDTH}px`,
-					},
-				},
-				{
-					selector: 'node[type="central"]',
-					style: {
-						"background-color": "#c7b194",
-						width: "30px",
-						height: "30px",
-						label: "data(label)",
-						"text-valign": "bottom",
-						"text-halign": "center",
-						"text-margin-y": 10,
-						"font-size": "14px",
-						"font-weight": "bold",
-						color: "#fff",
-					},
-				},
-				{
-					selector: 'node[type="branch"][direction="north"]',
-					style: {
-						"background-color": "#607c87",
-						width: "15px",
-						height: "15px",
-						label: "data(label)",
-						"text-valign": "top",
-						"text-halign": "center",
-						"text-margin-y": -10,
-						"font-size": "12px",
-						color: "#fff",
-					},
-				},
-				{
-					selector: 'node[type="branch"][direction="east"]',
-					style: {
-						"background-color": "#76b12b",
-						width: "15px",
-						height: "15px",
-						label: "data(label)",
-						"text-valign": "bottom",
-						"text-halign": "center",
-						"text-margin-y": 10,
-						"font-size": "12px",
-						color: "#fff",
-					},
-				},
-				{
-					selector: 'node[type="branch"][direction="south"]',
-					style: {
-						"background-color": "#c7b194",
-						width: "15px",
-						height: "15px",
-						label: "data(label)",
-						"text-valign": "bottom",
-						"text-halign": "center",
-						"text-margin-y": 10,
-						"font-size": "12px",
-						color: "#fff",
-					},
-				},
-				{
-					selector: 'node[type="branch"][direction="west"]',
-					style: {
-						"background-color": "#f0533f",
-						width: "15px",
-						height: "15px",
-						label: "data(label)",
-						"text-valign": "top",
-						"text-halign": "center",
-						"text-margin-y": -10,
-						"font-size": "12px",
-						color: "#fff",
-					},
-				},
+				// Shared compass styling (wrapped labels, central node, the
+				// four direction-colored branch selectors, base edges) plus
+				// this view's extras below.
+				...baseGraphStyles({ centralSize: 30, branchSize: 15, centralFont: 14, branchFont: 12 }),
 				{
 					selector: 'node[type="secondary"]',
 					style: {
@@ -2377,19 +2406,6 @@ export class NavigationView extends ItemView {
 						color: "#fff",
 						opacity: 0,
 						visibility: "hidden",
-					},
-				},
-				{
-					selector: "edge",
-					style: {
-						width: "0.5px",
-						"line-color": "#917959",
-						"target-arrow-shape": "triangle",
-						"target-arrow-color": "#917959",
-						"source-arrow-shape": "none",
-						"arrow-scale": 0.6,
-						"curve-style": "bezier",
-						opacity: 0.5,
 					},
 				},
 				{
@@ -2544,7 +2560,7 @@ export class NavigationView extends ItemView {
 		// from adjacent branches land on top of each other. Resolve globally:
 		// secondaries move, central + primaries stay anchored.
 		if (this.cy) {
-			this.resolveLabelOverlaps(
+			resolveLabelOverlaps(
 				this.cy.nodes('[type="secondary"]'),
 				this.cy.nodes('[type="central"], [type="branch"]')
 			);
@@ -2699,7 +2715,7 @@ export class NavigationView extends ItemView {
 
 			const branchPos = branchNode.position();
 			const scale = 0.6;
-			const posArray = this.calculateNodePositions(
+			const posArray = calculateNodePositions(
 				layoutDir,
 				trueSecondaries.length,
 				branchPos.x,
@@ -2803,7 +2819,7 @@ export class NavigationView extends ItemView {
 			const secPos = secondaryNode.position();
 			const scale = 0.4;
 			const oppDir = this.getOppositeDirection(layoutDir);
-			const posArray = this.calculateNodePositions(
+			const posArray = calculateNodePositions(
 				oppDir,
 				tertiaryLinks.length,
 				secPos.x,
@@ -2857,7 +2873,7 @@ export class NavigationView extends ItemView {
 				let added = this.cy.collection();
 				for (const id of addedIds) added = added.union(this.cy.getElementById(id));
 				const fixed = this.cy.nodes('[type="central"], [type="branch"], [type="secondary"]');
-				this.resolveLabelOverlaps(added.nodes(), fixed);
+				resolveLabelOverlaps(added.nodes(), fixed);
 			}
 		} catch (error) {
 			console.error("Error loading tertiary nodes:", error);
