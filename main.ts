@@ -1990,6 +1990,12 @@ export class NavigationView extends ItemView {
 		}
 	}
 
+	// Positions are NOT clamped to the container — each node gets enough room
+	// for its (wrapped) label and the layout grows as needed. render() fits
+	// the camera afterwards, so a crowded compass spreads out instead of
+	// overlapping. Node labels wrap at LABEL_MAX_WIDTH (see cytoscape styles).
+	static readonly LABEL_MAX_WIDTH = 140;
+
 	calculateNodePositions(
 		direction: string,
 		nodeCount: number,
@@ -2003,75 +2009,123 @@ export class NavigationView extends ItemView {
 		const dir = direction.toLowerCase();
 		const isLateral = dir === "east" || dir === "west";
 
-		// Label dimensions
+		// Label dimensions. Width is capped because labels wrap; rows are
+		// tall enough for a two-line wrapped label.
 		const charWidth = 7;
-		const labelHeight = 22;
 		const labelWidths = labels
-			? labels.map((l) => l.length * charWidth + 16)
+			? labels.map((l) => Math.min(l.length * charWidth + 16, NavigationView.LABEL_MAX_WIDTH))
 			: Array(nodeCount).fill(60);
 
 		const halfW = containerWidth / 2;
 		const halfH = containerHeight / 2;
 
 		if (isLateral) {
-			// East/West: nodes must stay firmly in their horizontal half
-			// Primary axis = x (pushed out east or west)
-			// Secondary axis = y (spread vertically, but clamped near center)
+			// East/West: primary axis = x (pushed out into the half), nodes
+			// stacked vertically with a guaranteed per-row gap.
 			const xSign = dir === "east" ? 1 : -1;
-
-			// X: strongly pushed into their half — 40% to 80% of halfW
 			const xBase = halfW * 0.45;
 			const xRange = halfW * 0.35;
-
-			// Y: spread vertically but stay within ±40% of halfH from center
-			const yLimit = halfH * 0.4;
-			const rowGap = Math.max(labelHeight, (yLimit * 2) / Math.max(1, nodeCount));
-
+			const rowGap = 38;
 			const startY = centerY - ((nodeCount - 1) * rowGap) / 2;
 
 			for (let i = 0; i < nodeCount; i++) {
-				// Stagger x outward: alternate near/far
+				// Stagger x outward: alternate near/far so neighboring labels
+				// also separate horizontally.
 				const xDepth = nodeCount <= 1 ? 0.5
 					: (i % 2 === 0 ? 0.2 : 0.8);
-				const x = centerX + xSign * (xBase + xDepth * xRange);
-
-				// Y evenly spaced
-				const y = startY + i * rowGap;
-
-				positions.push({ x, y });
+				positions.push({
+					x: centerX + xSign * (xBase + xDepth * xRange),
+					y: startY + i * rowGap,
+				});
 			}
 		} else {
-			// North/South: nodes must stay firmly in their vertical half
-			// Primary axis = y (pushed up or down)
-			// Secondary axis = x (spread horizontally, clamped near center)
+			// North/South: primary axis = y. Nodes alternate between a near
+			// and a far tier; each tier is packed independently by actual
+			// label width so labels in the same tier can never collide, and
+			// the tier separation keeps cross-tier labels apart.
 			const ySign = dir === "south" ? 1 : -1;
-
-			// Y: strongly pushed into their half — 40% to 80% of halfH
 			const yBase = halfH * 0.45;
 			const yRange = halfH * 0.35;
+			const gap = 18;
 
-			// X: spread horizontally but stay within ±40% of halfW from center
-			const xLimit = halfW * 0.4;
-			const totalWidth = labelWidths.reduce((s, w) => s + w, 0);
-			const availW = xLimit * 2;
-			const gap = Math.max(8, (availW - totalWidth) / Math.max(1, nodeCount - 1));
+			const tiers: number[][] = [[], []];
+			for (let i = 0; i < nodeCount; i++) tiers[i % 2].push(i);
 
-			let currentX = centerX - (totalWidth + gap * (nodeCount - 1)) / 2;
+			const xs: number[] = new Array(nodeCount).fill(centerX);
+			for (const tier of tiers) {
+				if (!tier.length) continue;
+				const total = tier.reduce((s, idx) => s + labelWidths[idx], 0) + gap * (tier.length - 1);
+				let cur = centerX - total / 2;
+				for (const idx of tier) {
+					xs[idx] = cur + labelWidths[idx] / 2;
+					cur += labelWidths[idx] + gap;
+				}
+			}
 
 			for (let i = 0; i < nodeCount; i++) {
-				const x = currentX + labelWidths[i] / 2;
-				currentX += labelWidths[i] + gap;
-
-				// Stagger y depth: alternate near/far
 				const yDepth = nodeCount <= 1 ? 0.5
 					: (i % 2 === 0 ? 0.2 : 0.8);
-				const y = centerY + ySign * (yBase + yDepth * yRange);
-
-				positions.push({ x, y });
+				positions.push({
+					x: xs[i],
+					y: centerY + ySign * (yBase + yDepth * yRange),
+				});
 			}
 		}
 
 		return positions;
+	}
+
+	// Push overlapping labels apart. Per-direction placement can't see other
+	// branches' secondary clusters (or the primaries' labels), so after
+	// placement we resolve collisions globally: every node's RENDERED bounding
+	// box (label included, via cytoscape's boundingBox) is treated as solid,
+	// and overlapping pairs are pushed apart along the axis of least
+	// penetration. Nodes in `fixed` never move; when two movable nodes
+	// collide each takes half the push. Iterates until stable.
+	private resolveLabelOverlaps(
+		movable: cytoscape.NodeCollection,
+		fixed: cytoscape.NodeCollection
+	) {
+		if (!this.cy || movable.length === 0) return;
+		const pad = 8;
+		const movableIds = new Set(movable.map((n) => n.id()));
+		const nodes: cytoscape.NodeSingular[] = movable.union(fixed).nodes().toArray();
+
+		for (let iter = 0; iter < 50; iter++) {
+			let moved = false;
+			for (let i = 0; i < nodes.length; i++) {
+				for (let j = i + 1; j < nodes.length; j++) {
+					const a = nodes[i];
+					const b = nodes[j];
+					const aMov = movableIds.has(a.id());
+					const bMov = movableIds.has(b.id());
+					if (!aMov && !bMov) continue;
+
+					const ba = a.boundingBox({ includeLabels: true });
+					const bb = b.boundingBox({ includeLabels: true });
+					const overlapX = Math.min(ba.x2, bb.x2) - Math.max(ba.x1, bb.x1) + pad;
+					const overlapY = Math.min(ba.y2, bb.y2) - Math.max(ba.y1, bb.y1) + pad;
+					if (overlapX <= 0 || overlapY <= 0) continue;
+					moved = true;
+
+					// Push along whichever axis needs the smaller shift.
+					const axis: "x" | "y" = overlapX < overlapY ? "x" : "y";
+					const amount = axis === "x" ? overlapX : overlapY;
+					// a goes negative-ward if it's on the negative side of b.
+					const aSign = a.position()[axis] <= b.position()[axis] ? -1 : 1;
+
+					if (aMov && bMov) {
+						a.position(axis, a.position(axis) + aSign * amount / 2);
+						b.position(axis, b.position(axis) - aSign * amount / 2);
+					} else if (aMov) {
+						a.position(axis, a.position(axis) + aSign * amount);
+					} else {
+						b.position(axis, b.position(axis) - aSign * amount);
+					}
+				}
+			}
+			if (!moved) break;
+		}
 	}
 
 	async render() {
@@ -2214,6 +2268,15 @@ export class NavigationView extends ItemView {
 			container: cyContainer,
 			elements: [...nodes, ...edges],
 			style: [
+				{
+					// Base label behavior for every node: wrap long titles
+					// instead of letting them run into neighboring labels.
+					selector: "node",
+					style: {
+						"text-wrap": "wrap",
+						"text-max-width": `${NavigationView.LABEL_MAX_WIDTH}px`,
+					},
+				},
 				{
 					selector: 'node[type="central"]',
 					style: {
@@ -2364,21 +2427,48 @@ export class NavigationView extends ItemView {
 			this.cy.on("tap", "node", (evt) => {
 				const node = evt.target;
 				const data = node.data();
+				const linkName = data.type === "central"
+					? activeFile.name
+					: (data.fileName || data.label || "");
+				if (!linkName) return;
 
-				if (data.type === "central") {
-					this.app.workspace.openLinkText(activeFile.name, "");
+				// Shift+click opens in a vertical split to the right of the
+				// current note; plain click reuses the active leaf.
+				const original = evt.originalEvent as MouseEvent | undefined;
+				if (original?.shiftKey) {
+					this.app.workspace.openLinkText(linkName, "", "split");
 				} else {
-					const fileName = data.fileName || data.label || "";
-					this.app.workspace.openLinkText(fileName, "");
+					this.app.workspace.openLinkText(linkName, "");
 				}
 			});
 
-			// Right-click anywhere in the graph (node or background) opens
-			// a small action menu.
+			// Right-click anywhere in the graph opens a small action menu.
+			// On a node, it leads with open-in-new-tab / open-in-split for
+			// that note; on the background it's just the graph actions.
 			this.cy.on("cxttap", (evt) => {
 				const original = evt.originalEvent as MouseEvent | undefined;
 				if (original) original.preventDefault?.();
 				const menu = new Menu();
+				const target = evt.target;
+				if (target && target !== this.cy && typeof target.isNode === "function" && target.isNode()) {
+					const data = target.data();
+					const linkName = data.type === "central"
+						? activeFile.name
+						: (data.fileName || data.label || "");
+					if (linkName) {
+						menu.addItem((item) =>
+							item.setTitle("Open in new tab")
+								.setIcon("file-plus")
+								.onClick(() => this.app.workspace.openLinkText(linkName, "", "tab"))
+						);
+						menu.addItem((item) =>
+							item.setTitle("Open to the right")
+								.setIcon("separator-vertical")
+								.onClick(() => this.app.workspace.openLinkText(linkName, "", "split"))
+						);
+						menu.addSeparator();
+					}
+				}
 				menu.addItem((item) =>
 					item.setTitle("Refresh")
 						.setIcon("refresh-cw")
@@ -2450,6 +2540,23 @@ export class NavigationView extends ItemView {
 			}
 		}
 
+		// Per-branch placement can't see other branches' secondaries — clusters
+		// from adjacent branches land on top of each other. Resolve globally:
+		// secondaries move, central + primaries stay anchored.
+		if (this.cy) {
+			this.resolveLabelOverlaps(
+				this.cy.nodes('[type="secondary"]'),
+				this.cy.nodes('[type="central"], [type="branch"]')
+			);
+		}
+
+		// Positions are unclamped, so a busy compass extends past the pane.
+		// Fit the camera to everything visible (tertiaries stay hidden until
+		// hover) — spread out beats overlapping, and pan/zoom remain live.
+		if (this.cy) {
+			const visible = this.cy.elements().filter((el) => el.data("type") !== "tertiary");
+			if (visible.length > 1) this.cy.fit(visible, 30);
+		}
 	}
 
 	// For each primary branch B, look at B's same-role admonition block and
@@ -2705,12 +2812,14 @@ export class NavigationView extends ItemView {
 				this.cy.height() * scale
 			);
 
+			const addedIds: string[] = [];
 			tertiaryLinks.forEach((tLink, i) => {
 				const tLinkLC = tLink.toLowerCase();
 				if (addedTertiary.has(tLinkLC)) return;
 				addedTertiary.add(tLinkLC);
 
 				const tId = data.id + "_tertiary_" + i;
+				addedIds.push(tId);
 				this.cy?.add({
 					group: "nodes",
 					data: {
@@ -2740,6 +2849,16 @@ export class NavigationView extends ItemView {
 					},
 				});
 			});
+
+			// Tertiaries are placed around the hovered secondary with no
+			// knowledge of the rest of the graph — push them off everything
+			// already visible (and each other) before they appear.
+			if (addedIds.length && this.cy) {
+				let added = this.cy.collection();
+				for (const id of addedIds) added = added.union(this.cy.getElementById(id));
+				const fixed = this.cy.nodes('[type="central"], [type="branch"], [type="secondary"]');
+				this.resolveLabelOverlaps(added.nodes(), fixed);
+			}
 		} catch (error) {
 			console.error("Error loading tertiary nodes:", error);
 		}
@@ -3267,7 +3386,72 @@ export default class FourWindsPlugin extends Plugin {
 
 		this.addSettingTab(new FourWindsSettingTab(this.app, this));
 
+		// Compass links live inside admonition codeblocks, which Obsidian's
+		// built-in "update internal links on rename" pass ignores. Track
+		// renames ourselves and rewrite [[Old Name]] inside compass blocks
+		// vault-wide.
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (file instanceof TFile && file.extension === "md") {
+					this.handleNoteRename(file, oldPath).catch((err) =>
+						console.error("[Four Winds] rename sync failed:", err)
+					);
+				}
+			})
+		);
+
 		this.activateCompassView();
+	}
+
+	// Rewrite [[oldBasename]] → [[newBasename]] inside every compass
+	// admonition block in the vault. Only fires on true renames (basename
+	// changed); folder moves keep the basename and wikilinks stay valid.
+	// Alias / heading suffixes are preserved; path prefixes are dropped
+	// because the new location may differ and bare basenames always resolve.
+	async handleNoteRename(file: TFile, oldPath: string) {
+		const oldName = oldPath.slice(oldPath.lastIndexOf("/") + 1);
+		const oldBase = oldName.replace(/\.md$/i, "");
+		const newBase = file.basename;
+		if (!oldBase || oldBase === newBase) return;
+
+		// Give Obsidian's own link updater a beat to finish rewriting regular
+		// (non-codeblock) links so we don't race its writes in the same files.
+		await new Promise((r) => setTimeout(r, 1000));
+
+		const settings = this.settings;
+		const tags = ROLES.map((role) => tagFor(settings, role));
+		const linkRe = new RegExp(
+			"\\[\\[(?:[^\\]\\n#|]*\\/)?" + escapeRegExpStr(oldBase) + "(?:\\.md)?([#|][^\\]\\n]*)?\\]\\]",
+			"gi"
+		);
+		const oldBaseLC = oldBase.toLowerCase();
+
+		let updatedFiles = 0;
+		for (const md of this.app.vault.getMarkdownFiles() as TFile[]) {
+			const peek = await this.app.vault.cachedRead(md);
+			// Cheap early-out — most files won't mention the old name at all.
+			if (!peek.toLowerCase().includes(oldBaseLC)) continue;
+
+			let changed = false;
+			await this.app.vault.process(md, (content: string) => {
+				let next = content;
+				for (const tag of tags) {
+					const blockRe = new RegExp("```" + escapeRegExpStr(tag) + "\\n([\\s\\S]*?)```", "gm");
+					next = next.replace(blockRe, (full, inner: string) => {
+						const rewritten = inner.replace(linkRe, (_m, suffix: string) => `[[${newBase}${suffix || ""}]]`);
+						if (rewritten === inner) return full;
+						changed = true;
+						return "```" + tag + "\n" + rewritten + "```";
+					});
+				}
+				return next;
+			});
+			if (changed) updatedFiles++;
+		}
+
+		if (updatedFiles > 0) {
+			new Notice(`Four Winds: updated compass links in ${updatedFiles} note${updatedFiles === 1 ? "" : "s"} ([[${oldBase}]] → [[${newBase}]])`);
+		}
 	}
 
 	onunload() {

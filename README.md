@@ -87,6 +87,8 @@ You can rename any of these in Settings → Compass — whatever you set there b
 
 Aliased links (`[[Note|alias]]`), heading links (`[[Note#section]]`), and path-prefixed links (`[[folder/Note]]`) all work — Four Winds matches by basename.
 
+**Renaming a note is safe.** Obsidian's built-in "update internal links" pass deliberately ignores links inside codeblocks, so compass links would normally break silently on rename. Four Winds watches for renames itself and rewrites `[[Old Name]]` → `[[New Name]]` inside every compass block in the vault, preserving alias and heading suffixes. Moving a note between folders doesn't trigger anything — links match by basename, so they stay valid.
+
 ---
 
 ## Commands
@@ -94,7 +96,7 @@ Aliased links (`[[Note|alias]]`), heading links (`[[Note#section]]`), and path-p
 | Command | What it does |
 |---|---|
 | **Open Compass View** | Side panel with the active note's four compass sections. Each section combines two sources: literal links from the note's own admonition blocks, *and* dynamically-discovered incoming references (notes that list this one in their compass). |
-| **Open Navigation View** | Full-tab cytoscape graph of compass connections branching from the active note. |
+| **Open Navigation View** | Full-tab cytoscape graph of compass connections branching from the active note. Primary connections are color-coded by direction; second- and third-degree connections fade in around them, with labels automatically spread so they never overlap (pan/zoom to explore). Click a node to open it, **Shift+click** to open it in a split to the right, or **right-click** for "Open in new tab" / "Open to the right" plus graph actions. |
 | **Process Seeds** | Swipe-card modal for triaging *fleeting notes* (raw, unprocessed entries). Each card represents one seed; swipe up/right/down/left to link it as parent / supportive sibling / child / challenging sibling of your active note, or skip / trash. Optionally runs a template to convert the seed into a structured note (see Processing settings). |
 | **Discover** | Swipe-card modal that surfaces notes from your discovery folders so you can connect them into the active note's compass. Same swipe controls as Process Seeds, but no template processing — pure connection-making. See [Discover keyboard controls](#discover-keyboard-controls). |
 | **Auto-link compass from references** | Scans every note in the vault for incoming compass references to the active note, then back-fills the inverse role into your compass. Pure additive: existing entries are never touched. Use it after a discovery session, or anytime you want to make sure your compass reflects what others have declared about it. |
